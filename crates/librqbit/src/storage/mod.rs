@@ -186,6 +186,20 @@ pub trait TorrentStorage: Send + Sync {
     fn on_piece_invalidated(&self, _piece_index: ValidPieceIndex) -> anyhow::Result<()> {
         Ok(())
     }
+
+    /// Called under the torrent's state lock before the torrent requests a piece from a peer.
+    /// Returning false leaves the piece unrequested for now; call
+    /// [`ManagedTorrent::reselect_pieces`](crate::ManagedTorrent::reselect_pieces) once it may
+    /// succeed. It must not call back into the torrent. Default implementation allows every piece.
+    fn reserve_piece(&self, _piece_index: ValidPieceIndex) -> bool {
+        true
+    }
+
+    /// Called under the torrent's state lock when a piece requested after
+    /// [`reserve_piece`](Self::reserve_piece) goes back to the queue without passing its hash
+    /// check: its peer died, its hash check failed, or the torrent paused. The storage may drop
+    /// the piece's partial data and its reservation. Default implementation does nothing.
+    fn release_piece(&self, _piece_index: ValidPieceIndex) {}
 }
 
 impl<U: TorrentStorage + ?Sized> TorrentStorage for Box<U> {
@@ -236,6 +250,14 @@ impl<U: TorrentStorage + ?Sized> TorrentStorage for Box<U> {
 
     fn on_piece_invalidated(&self, piece_id: ValidPieceIndex) -> anyhow::Result<()> {
         (**self).on_piece_invalidated(piece_id)
+    }
+
+    fn reserve_piece(&self, piece_id: ValidPieceIndex) -> bool {
+        (**self).reserve_piece(piece_id)
+    }
+
+    fn release_piece(&self, piece_id: ValidPieceIndex) {
+        (**self).release_piece(piece_id)
     }
 }
 

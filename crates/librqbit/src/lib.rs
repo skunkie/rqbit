@@ -63,6 +63,7 @@ mod listen;
 mod merge_streams;
 mod peer_connection;
 mod peer_info_reader;
+pub mod piece_selector;
 mod piece_tracker;
 mod read_buf;
 mod session;
@@ -91,14 +92,15 @@ pub use dht;
 pub use librqbit_core::spawn_utils::spawn as librqbit_spawn;
 pub use listen::{ListenerMode, ListenerOptions};
 pub use peer_connection::PeerConnectionOptions;
+pub use piece_selector::PieceSelector;
 pub use session::{
     AddTorrent, AddTorrentOptions, AddTorrentResponse, DhtSessionConfig, ListOnlyResponse,
     SUPPORTED_SCHEMES, Session, SessionOptions, SessionPersistenceConfig,
 };
 pub use stream_connect::ConnectionOptions;
 pub use torrent_state::{
-    ManagedTorrent, ManagedTorrentShared, ManagedTorrentState, TorrentMetadata, TorrentStats,
-    TorrentStatsState,
+    FileStream, ManagedTorrent, ManagedTorrentShared, ManagedTorrentState, TorrentMetadata,
+    TorrentStats, TorrentStatsState,
 };
 pub use type_aliases::FileInfos;
 

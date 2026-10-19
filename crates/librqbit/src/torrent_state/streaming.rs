@@ -415,4 +415,8 @@ impl FileStream {
     pub fn len(&self) -> u64 {
         self.file_len
     }
+
+    pub fn is_empty(&self) -> bool {
+        self.file_len == 0
+    }
 }

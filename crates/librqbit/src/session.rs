@@ -12,7 +12,7 @@ use std::{
 };
 
 use crate::{
-    ApiError, CreateTorrentOptions, FileInfos, ManagedTorrent, ManagedTorrentShared,
+    ApiError, CreateTorrentOptions, FileInfos, ManagedTorrent, ManagedTorrentShared, PieceSelector,
     api::TorrentIdOrHash,
     api_error::WithStatus,
     bitv_factory::{BitVFactory, NonPersistentBitVFactory},
@@ -298,6 +298,10 @@ pub struct AddTorrentOptions {
 
     // Custom trackers
     pub trackers: Option<Vec<String>>,
+
+    /// Decides which pieces to request first, in place of the readahead of streams.
+    #[serde(skip)]
+    pub piece_selector: Option<Arc<dyn PieceSelector>>,
 
     /// Don't upload this torrent: send peers no bitfield or `have` messages, keep them
     /// choked, and disconnect a peer that requests a piece anyway. The `disable-upload`
@@ -1376,6 +1380,7 @@ impl Session {
                     initial_peers: opts.initial_peers.clone().unwrap_or_default(),
                     peer_limit: opts.peer_limit.or(self.peer_limit),
                     disable_upload: opts.disable_upload || self.disable_upload_by_default(),
+                    piece_selector: opts.piece_selector.clone(),
                 },
                 connector: self.connector.clone(),
                 session: Arc::downgrade(self),

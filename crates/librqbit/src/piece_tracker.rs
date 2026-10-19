@@ -46,11 +46,12 @@ pub enum AcquireResult {
 }
 
 /// Parameters for acquiring a piece.
-pub struct AcquireRequest<'a, I, P, S>
+pub struct AcquireRequest<'a, I, P, S, R>
 where
     I: Iterator<Item = ValidPieceIndex>,
     P: Fn(ValidPieceIndex) -> bool,
     S: Fn(ValidPieceIndex) -> bool,
+    R: FnMut(ValidPieceIndex) -> bool,
 {
     /// The peer requesting a piece.
     pub peer: PeerHandle,
@@ -66,6 +67,10 @@ where
     pub peer_has_piece: P,
     /// Returns true if the piece can be stolen (e.g., not locked for writing).
     pub can_steal: S,
+    /// Called last, right before a piece is reserved; returns false to skip it.
+    pub can_reserve: R,
+    /// Whether to reserve queued pieces once no priority piece can be reserved.
+    pub queued_pieces: bool,
 }
 
 /// Coordinates piece download state.
@@ -120,11 +125,15 @@ impl PieceTracker {
     ///
     /// If `Stolen` is returned, the caller MUST call `peers.on_steal()` to notify
     /// the old peer and update counters.
-    pub fn acquire_piece<I, P, S>(&mut self, mut req: AcquireRequest<I, P, S>) -> AcquireResult
+    pub fn acquire_piece<I, P, S, R>(
+        &mut self,
+        mut req: AcquireRequest<I, P, S, R>,
+    ) -> AcquireResult
     where
         I: Iterator<Item = ValidPieceIndex>,
         P: Fn(ValidPieceIndex) -> bool,
         S: Fn(ValidPieceIndex) -> bool,
+        R: FnMut(ValidPieceIndex) -> bool,
     {
         // 1. Try steal with 10x threshold (very slow peer)
         if let Some(result) = self.try_steal(&req, 10.0) {
@@ -137,6 +146,7 @@ impl PieceTracker {
             if !self.chunks.is_piece_have(piece)
                 && !self.inflight.contains_key(&piece)
                 && (req.peer_has_piece)(piece)
+                && (req.can_reserve)(piece)
             {
                 return self.reserve_piece(piece, req.peer);
             }
@@ -144,13 +154,16 @@ impl PieceTracker {
 
         // Then check naturally ordered queued pieces
         // Note: iter_queued_pieces only returns pieces in queue_pieces (not in-flight)
-        let queued: Vec<_> = self
-            .chunks
-            .iter_queued_pieces(req.file_priorities, req.file_infos)
-            .collect();
+        let queued: Vec<_> = if req.queued_pieces {
+            self.chunks
+                .iter_queued_pieces(req.file_priorities, req.file_infos)
+                .collect()
+        } else {
+            Vec::new()
+        };
 
         for piece in queued {
-            if (req.peer_has_piece)(piece) {
+            if (req.peer_has_piece)(piece) && (req.can_reserve)(piece) {
                 return self.reserve_piece(piece, req.peer);
             }
         }
@@ -177,15 +190,16 @@ impl PieceTracker {
     }
 
     /// Try to steal a piece from a slower peer.
-    fn try_steal<I, P, S>(
+    fn try_steal<I, P, S, R>(
         &mut self,
-        req: &AcquireRequest<I, P, S>,
+        req: &AcquireRequest<I, P, S, R>,
         threshold: f64,
     ) -> Option<AcquireResult>
     where
         I: Iterator<Item = ValidPieceIndex>,
         P: Fn(ValidPieceIndex) -> bool,
         S: Fn(ValidPieceIndex) -> bool,
+        R: FnMut(ValidPieceIndex) -> bool,
     {
         let my_avg = req.peer_avg_time?;
         let min_elapsed = Duration::from_secs_f64(my_avg.as_secs_f64() * threshold);
@@ -248,8 +262,8 @@ impl PieceTracker {
     /// Release all pieces owned by a peer (on peer death).
     ///
     /// Moves all pieces owned by the peer from IN_FLIGHT back to QUEUED.
-    /// Returns the number of pieces released.
-    pub fn release_pieces_owned_by(&mut self, peer: PeerHandle) -> usize {
+    /// Returns the pieces released.
+    pub fn release_pieces_owned_by(&mut self, peer: PeerHandle) -> Vec<ValidPieceIndex> {
         // Collect pieces to release (can't modify while iterating)
         let pieces_to_release: Vec<_> = self
             .inflight
@@ -258,12 +272,11 @@ impl PieceTracker {
             .map(|(p, _)| *p)
             .collect();
 
-        let count = pieces_to_release.len();
-        for piece in pieces_to_release {
+        for &piece in &pieces_to_release {
             self.inflight.remove(&piece);
             self.chunks.mark_piece_broken_if_not_have(piece);
         }
-        count
+        pieces_to_release
     }
 
     // === QUERIES ===
@@ -271,6 +284,11 @@ impl PieceTracker {
     /// Get the inflight info for a piece, if it's currently being downloaded.
     pub fn get_inflight(&self, piece: ValidPieceIndex) -> Option<&InflightPiece> {
         self.inflight.get(&piece)
+    }
+
+    /// The pieces currently in-flight.
+    pub fn inflight_pieces(&self) -> impl Iterator<Item = ValidPieceIndex> + '_ {
+        self.inflight.keys().copied()
     }
 
     /// Check if a piece is currently in-flight.
@@ -387,6 +405,54 @@ mod tests {
     }
 
     #[test]
+    fn test_a_piece_the_storage_cannot_reserve_is_skipped() {
+        let chunks = make_test_chunk_tracker(5);
+        let mut tracker = PieceTracker::new(chunks);
+        let file_infos = make_test_file_infos(5);
+        let file_priorities = make_default_file_priorities(&file_infos);
+        let lengths = *tracker.chunks().get_lengths();
+        let piece = |i| lengths.validate_piece_index(i).unwrap();
+        let mut asked = Vec::new();
+
+        let result = tracker.acquire_piece(AcquireRequest {
+            peer: peer(1),
+            peer_avg_time: None,
+            priority_pieces: [piece(3), piece(4)].into_iter(),
+            file_priorities: &file_priorities,
+            file_infos: &file_infos,
+            peer_has_piece: |_| true,
+            can_steal: |_| true,
+            can_reserve: |p| {
+                asked.push(p.get());
+                p.get() != 3
+            },
+            queued_pieces: true,
+        });
+        assert!(matches!(result, AcquireResult::Reserved(p) if p.get() == 4));
+        assert_eq!(asked, [3, 4]);
+        assert!(
+            !tracker.is_inflight(piece(3)),
+            "a refused piece stays queued"
+        );
+
+        let result = tracker.acquire_piece(AcquireRequest {
+            peer: peer(1),
+            peer_avg_time: None,
+            priority_pieces: std::iter::empty(),
+            file_priorities: &file_priorities,
+            file_infos: &file_infos,
+            peer_has_piece: |_| true,
+            can_steal: |_| true,
+            can_reserve: |_| true,
+            queued_pieces: false,
+        });
+        assert!(
+            matches!(result, AcquireResult::NoneAvailable),
+            "only priority pieces are requested without queued pieces"
+        );
+    }
+
+    #[test]
     fn test_reserve_piece_from_queue() {
         let chunks = make_test_chunk_tracker(5);
         let mut tracker = PieceTracker::new(chunks);
@@ -402,6 +468,8 @@ mod tests {
             file_infos: &file_infos,
             peer_has_piece: |_| true, // Peer has all pieces
             can_steal: |_| true,
+            can_reserve: |_| true,
+            queued_pieces: true,
         });
 
         // Should reserve piece 0 (first in queue)
@@ -435,6 +503,8 @@ mod tests {
             file_infos: &file_infos,
             peer_has_piece: |p| p.get() >= 2,
             can_steal: |_| true,
+            can_reserve: |_| true,
+            queued_pieces: true,
         });
 
         match result {
@@ -463,6 +533,8 @@ mod tests {
             file_infos: &file_infos,
             peer_has_piece: |_| true,
             can_steal: |_| true,
+            can_reserve: |_| true,
+            queued_pieces: true,
         });
 
         let piece = match result {
@@ -496,6 +568,8 @@ mod tests {
             file_infos: &file_infos,
             peer_has_piece: |_| true,
             can_steal: |_| true,
+            can_reserve: |_| true,
+            queued_pieces: true,
         });
 
         let piece = match result {
@@ -524,6 +598,8 @@ mod tests {
             file_infos: &file_infos,
             peer_has_piece: |p| p == piece, // Only has the failed piece
             can_steal: |_| true,
+            can_reserve: |_| true,
+            queued_pieces: true,
         });
 
         match result2 {
@@ -553,6 +629,8 @@ mod tests {
             file_infos: &file_infos,
             peer_has_piece: |_| true,
             can_steal: |_| true,
+            can_reserve: |_| true,
+            queued_pieces: true,
         }) {
             AcquireResult::Reserved(p) => p,
             _ => panic!("Expected Reserved"),
@@ -565,6 +643,8 @@ mod tests {
             file_infos: &file_infos,
             peer_has_piece: |_| true,
             can_steal: |_| true,
+            can_reserve: |_| true,
+            queued_pieces: true,
         }) {
             AcquireResult::Reserved(p) => p,
             _ => panic!("Expected Reserved"),
@@ -579,6 +659,8 @@ mod tests {
             file_infos: &file_infos,
             peer_has_piece: |_| true,
             can_steal: |_| true,
+            can_reserve: |_| true,
+            queued_pieces: true,
         }) {
             AcquireResult::Reserved(p) => p,
             _ => panic!("Expected Reserved"),
@@ -591,7 +673,7 @@ mod tests {
 
         // Peer A dies
         let released = tracker.release_pieces_owned_by(peer_a);
-        assert_eq!(released, 2);
+        assert_eq!(released.len(), 2);
         assert_eq!(tracker.inflight_count(), 1); // Only peer B's piece remains
 
         // Verify peer B's piece is still in-flight
@@ -618,6 +700,8 @@ mod tests {
             file_infos: &file_infos,
             peer_has_piece: |_| true,
             can_steal: |_| true,
+            can_reserve: |_| true,
+            queued_pieces: true,
         });
         tracker.acquire_piece(AcquireRequest {
             peer: peer(1),
@@ -627,6 +711,8 @@ mod tests {
             file_infos: &file_infos,
             peer_has_piece: |_| true,
             can_steal: |_| true,
+            can_reserve: |_| true,
+            queued_pieces: true,
         });
 
         assert_eq!(tracker.inflight_count(), 2);
@@ -644,6 +730,8 @@ mod tests {
             file_infos: &file_infos,
             peer_has_piece: |_| true,
             can_steal: |_| true,
+            can_reserve: |_| true,
+            queued_pieces: true,
         });
 
         // Should get piece 0 again (was requeued)
@@ -682,6 +770,8 @@ mod tests {
             file_infos: &file_infos,
             peer_has_piece: |_| true,
             can_steal: |_| true,
+            can_reserve: |_| true,
+            queued_pieces: true,
         });
 
         // Should get piece 3 (first priority piece)
@@ -708,6 +798,8 @@ mod tests {
             file_infos: &file_infos,
             peer_has_piece: |_| false, // Peer has nothing
             can_steal: |_| true,
+            can_reserve: |_| true,
+            queued_pieces: true,
         });
 
         match result {
@@ -756,6 +848,8 @@ mod tests {
             file_infos: &file_infos,
             peer_has_piece: |_| true,
             can_steal: |_| true,
+            can_reserve: |_| true,
+            queued_pieces: true,
         }) {
             AcquireResult::Reserved(p) => {
                 assert_eq!(p.get(), 0);
@@ -772,6 +866,8 @@ mod tests {
             file_infos: &file_infos,
             peer_has_piece: |_| true,
             can_steal: |_| true,
+            can_reserve: |_| true,
+            queued_pieces: true,
         }) {
             AcquireResult::Reserved(p) => {
                 assert_eq!(p.get(), 4);
@@ -794,6 +890,8 @@ mod tests {
             file_infos: &file_infos,
             peer_has_piece: |p| p.get() == 4, // Peer B only has piece 4
             can_steal: |_| true,
+            can_reserve: |_| true,
+            queued_pieces: true,
         });
 
         // Should steal piece 4 (which peer B has), NOT piece 0 (which peer B doesn't have)

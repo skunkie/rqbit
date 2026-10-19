@@ -41,6 +41,7 @@ use crate::Session;
 use crate::chunk_tracker::ChunkTracker;
 use crate::file_info::FileInfo;
 use crate::limits::LimitsConfig;
+use crate::piece_selector::PieceSelector;
 use crate::session::TorrentId;
 use crate::spawn_utils::BlockingSpawner;
 use crate::storage::BoxStorageFactory;
@@ -119,6 +120,7 @@ pub(crate) struct ManagedTorrentOptions {
     pub initial_peers: Vec<SocketAddr>,
     pub peer_limit: Option<usize>,
     pub disable_upload: bool,
+    pub piece_selector: Option<Arc<dyn PieceSelector>>,
 }
 
 impl ManagedTorrentOptions {
@@ -466,6 +468,14 @@ impl ManagedTorrent {
 
     pub fn is_paused(&self) -> bool {
         self.locked.read().paused
+    }
+
+    /// Wake peers waiting for a piece to request, after the torrent's
+    /// [`PieceSelector`] or its storage's reservations changed.
+    pub fn reselect_pieces(&self) {
+        if let Some(live) = self.live() {
+            live.reselect_pieces();
+        }
     }
 
     /// Mark completed pieces as missing, for a storage that no longer holds their data, so that

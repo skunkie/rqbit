@@ -83,6 +83,8 @@ use tokio::sync::{
 use tokio_util::sync::CancellationToken;
 use tracing::{Instrument, debug, debug_span, error, info, trace, warn};
 
+use itertools::Either;
+
 use crate::{
     Error,
     chunk_tracker::{ChunkMarkingResult, ChunkTracker, HaveNeededSelected},
@@ -784,6 +786,9 @@ impl TorrentStateLive {
             .pieces
             .take()
             .context("bug: pausing already paused torrent")?;
+        for piece in piece_tracker.inflight_pieces() {
+            self.files.release_piece(piece);
+        }
         // into_chunks() will requeue any in-flight pieces
         let chunk_tracker = piece_tracker.into_chunks();
 
@@ -946,6 +951,10 @@ impl TorrentStateLive {
             self.reconnect_all_not_needed_peers();
         }
         Ok(invalidated)
+    }
+
+    pub(crate) fn reselect_pieces(&self) {
+        self.new_pieces_notify.notify_waiters();
     }
 
     pub(crate) fn reconnect_all_not_needed_peers(&self) {
@@ -1331,10 +1340,13 @@ impl PeerHandler {
                 // Release all pieces owned by this peer (fixes the bug where pieces
                 // could be in both queue_pieces AND inflight_pieces after peer death)
                 let released = g.get_pieces_mut()?.release_pieces_owned_by(self.addr);
-                if released > 0 {
+                for &piece in &released {
+                    self.state.files.release_piece(piece);
+                }
+                if !released.is_empty() {
                     trace!(
                         "peer dead, released {} in-flight pieces back to queue",
-                        released
+                        released.len()
                     );
                 }
 
@@ -1349,7 +1361,7 @@ impl PeerHandler {
                     );
                 }
 
-                if released > 0 || had_inflight {
+                if !released.is_empty() || had_inflight {
                     self.state.new_pieces_notify.notify_waiters();
                 }
             }
@@ -1489,10 +1501,22 @@ impl PeerHandler {
                     ..
                 } = &mut **g;
                 let pieces = pieces.as_mut().ok_or(Error::ChunkTrackerEmpty)?;
+                let selector = self.state.shared.options.piece_selector.as_deref();
+                let priority_pieces = match selector {
+                    Some(selector) => {
+                        let mut selected = Vec::new();
+                        selector.priority_pieces(&mut |piece| {
+                            selected.push(piece);
+                            true
+                        });
+                        Either::Left(selected.into_iter())
+                    }
+                    None => Either::Right(self.state.streams.iter_next_pieces(&self.state.lengths)),
+                };
                 let result = pieces.acquire_piece(AcquireRequest {
                     peer: self.addr,
                     peer_avg_time: self.counters.average_piece_download_time(),
-                    priority_pieces: self.state.streams.iter_next_pieces(&self.state.lengths),
+                    priority_pieces,
                     file_priorities,
                     file_infos: &self.state.metadata.file_infos,
                     peer_has_piece: |p| bf.get(p.get() as usize).map(|v| *v) == Some(true),
@@ -1501,6 +1525,8 @@ impl PeerHandler {
                             .try_write()
                             .is_some()
                     },
+                    can_reserve: |p| self.state.files.reserve_piece(p),
+                    queued_pieces: selector.is_none_or(|s| s.download_other_pieces()),
                 });
 
                 match result {
@@ -2029,6 +2055,7 @@ impl PeerHandler {
                         .lock_write("mark_piece_broken")
                         .get_pieces_mut()?
                         .mark_piece_hash_failed(chunk_info.piece_index);
+                    state.files.release_piece(chunk_info.piece_index);
                     state.new_pieces_notify.notify_waiters();
                     anyhow::bail!("i am probably a bogus peer. dying.")
                 }
