@@ -118,13 +118,6 @@ impl PeerState {
             PeerState::NotNeeded => "not needed",
         }
     }
-
-    pub fn take_live_no_counters(self) -> Option<LivePeerState> {
-        match self {
-            PeerState::Live(l) => Some(l),
-            _ => None,
-        }
-    }
 }
 
 #[derive(Debug, thiserror::Error)]

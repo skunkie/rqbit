@@ -895,16 +895,15 @@ impl TorrentStateLive {
     }
 
     fn disconnect_all_peers_that_have_full_torrent(&self) {
-        for mut pe in self.peers.states.iter_mut() {
+        for pe in self.peers.states.iter() {
             if let PeerState::Live(l) = pe.value().get_state()
                 && l.has_full_torrent(self.lengths.total_pieces() as usize)
             {
-                let prev = pe.value_mut().set_not_needed(&self.peers);
-                let _ = prev
-                    .take_live_no_counters()
-                    .unwrap()
-                    .tx
-                    .send(WriterRequest::Disconnect(Ok(())));
+                // The peer stays live until its task ends, and on_peer_died() marks it not
+                // needed then. Marking it now would let reconnect_all_not_needed_peers() queue
+                // it while the connection is still closing, and on_peer_died() would then
+                // find it queued and drop it for good.
+                let _ = l.tx.send(WriterRequest::Disconnect(Ok(())));
             }
         }
     }
