@@ -1268,6 +1268,10 @@ impl PeerConnectionHandler for &'_ PeerHandler {
         self.state.get_approx_have_bytes() > 0
     }
 
+    fn should_unchoke(&self) -> bool {
+        !self.state.torrent().options.disable_upload()
+    }
+
     fn should_transmit_have(&self, id: ValidPieceIndex) -> bool {
         if self.state.shared.options.disable_upload() {
             return false;

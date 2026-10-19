@@ -118,19 +118,12 @@ pub(crate) struct ManagedTorrentOptions {
     pub ratelimits: LimitsConfig,
     pub initial_peers: Vec<SocketAddr>,
     pub peer_limit: Option<usize>,
-    #[cfg(feature = "disable-upload")]
-    pub _disable_upload: bool,
+    pub disable_upload: bool,
 }
 
 impl ManagedTorrentOptions {
-    #[cfg(feature = "disable-upload")]
-    pub fn disable_upload(&self) -> bool {
-        self._disable_upload
-    }
-
-    #[cfg(not(feature = "disable-upload"))]
     pub const fn disable_upload(&self) -> bool {
-        false
+        self.disable_upload
     }
 }
 

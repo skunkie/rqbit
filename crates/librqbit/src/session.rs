@@ -298,6 +298,12 @@ pub struct AddTorrentOptions {
 
     // Custom trackers
     pub trackers: Option<Vec<String>>,
+
+    /// Don't upload this torrent: send peers no bitfield or `have` messages, keep them
+    /// choked, and disconnect a peer that requests a piece anyway. The `disable-upload`
+    /// feature's session option disables upload for every torrent.
+    #[serde(default)]
+    pub disable_upload: bool,
 }
 
 pub struct ListOnlyResponse {
@@ -1369,8 +1375,7 @@ impl Session {
                     ratelimits: opts.ratelimits,
                     initial_peers: opts.initial_peers.clone().unwrap_or_default(),
                     peer_limit: opts.peer_limit.or(self.peer_limit),
-                    #[cfg(feature = "disable-upload")]
-                    _disable_upload: self._disable_upload,
+                    disable_upload: opts.disable_upload || self.disable_upload_by_default(),
                 },
                 connector: self.connector.clone(),
                 session: Arc::downgrade(self),
@@ -1614,6 +1619,16 @@ impl Session {
         {
             warn!(storage=?p, error=?e, "error updating metadata")
         }
+    }
+
+    #[cfg(feature = "disable-upload")]
+    fn disable_upload_by_default(&self) -> bool {
+        self._disable_upload
+    }
+
+    #[cfg(not(feature = "disable-upload"))]
+    fn disable_upload_by_default(&self) -> bool {
+        false
     }
 
     pub async fn pause(&self, handle: &ManagedTorrentHandle) -> anyhow::Result<()> {
