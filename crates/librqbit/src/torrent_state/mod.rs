@@ -10,7 +10,7 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::Weak;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use anyhow::Context;
@@ -210,6 +210,9 @@ pub struct ManagedTorrent {
     pub metadata: ArcSwapOption<TorrentMetadata>,
     pub(crate) state_change_notify: Notify,
     pub(crate) locked: RwLock<ManagedTorrentLocked>,
+    // Incremented by invalidate_pieces() under `locked` before any storage drops data, so
+    // that a stream can tell whether what it read may come from a replaced piece.
+    pub(crate) invalidations: AtomicU64,
 }
 
 impl ManagedTorrent {
@@ -484,6 +487,7 @@ impl ManagedTorrent {
     /// refused, so this suits torrents that don't upload.
     pub fn invalidate_pieces(&self, pieces: &[ValidPieceIndex]) -> anyhow::Result<usize> {
         let mut g = self.locked.write();
+        self.invalidations.fetch_add(1, Ordering::Release);
         match &mut g.state {
             ManagedTorrentState::Live(live) => live.invalidate_pieces(pieces),
             ManagedTorrentState::Paused(paused) => Ok(paused.invalidate_pieces(pieces)),

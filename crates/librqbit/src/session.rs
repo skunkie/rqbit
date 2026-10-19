@@ -1395,6 +1395,7 @@ impl Session {
                 state_change_notify: Notify::new(),
                 shared: minfo,
                 metadata: ArcSwapOption::new(Some(metadata.clone())),
+                invalidations: Default::default(),
             });
 
             g.add_torrent(handle.clone(), id);
