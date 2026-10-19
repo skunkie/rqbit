@@ -189,14 +189,7 @@ impl AsyncRead for FileStream {
 
         // if the piece is not there, register to wake when it is
         // check if we have the piece for real
-        let have = poll_try_io!(self.torrent.with_chunk_tracker(|ct| {
-            let have = ct.get_have_pieces().as_slice()[current.id.get() as usize];
-            if !have {
-                self.streams
-                    .register_waker(self.stream_id, cx.waker().clone());
-            }
-            have
-        }));
+        let have = poll_try_io!(self.have_or_register_waker(current.id, cx));
         if !have {
             debug!(stream_id = self.stream_id, file_id = self.file_id, piece_id = %current.id, "poll pending, not have");
             return Poll::Pending;
@@ -215,18 +208,37 @@ impl AsyncRead for FileStream {
         let buf = &mut buf[..bytes_to_read];
 
         let start = Instant::now();
-        poll_try_io!(poll_try_io!(self.torrent.shared.spawner.block_in_place(
-            || {
-                self.torrent.with_storage_and_file(
-                    self.file_id,
-                    |files, _fi| {
-                        files.pread_exact(self.file_id, self.position, buf)?;
-                        Ok::<_, anyhow::Error>(())
-                    },
-                    &self.metadata,
-                )
+        let mut retried = false;
+        loop {
+            let read = self
+                .torrent
+                .shared
+                .spawner
+                .block_in_place(|| {
+                    self.torrent.with_storage_and_file(
+                        self.file_id,
+                        |files, _fi| files.pread_exact(self.file_id, self.position, buf),
+                        &self.metadata,
+                    )
+                })
+                .and_then(|r| r);
+            let Err(e) = read else {
+                break;
+            };
+            // The storage may have dropped the piece's data since the check above, from
+            // ManagedTorrent::invalidate_pieces(). It does so under the torrent's lock while the
+            // piece is marked missing, so checking again tells that apart from a failed read,
+            // unless the piece was downloaded again meanwhile, which one more read settles.
+            let have = poll_try_io!(self.have_or_register_waker(current.id, cx));
+            if !have {
+                debug!(stream_id = self.stream_id, file_id = self.file_id, piece_id = %current.id, "poll pending, piece invalidated while reading");
+                return Poll::Pending;
             }
-        )));
+            if retried {
+                poll_try_io!(Err::<(), _>(e));
+            }
+            retried = true;
+        }
 
         trace!(
             buflen = buf.len(),
@@ -380,6 +392,23 @@ impl ManagedTorrent {
 }
 
 impl FileStream {
+    // Registers the waker when the piece is missing, under the same lock as the check, so
+    // that its completion can't slip in between.
+    fn have_or_register_waker(
+        &self,
+        piece: ValidPieceIndex,
+        cx: &std::task::Context<'_>,
+    ) -> anyhow::Result<bool> {
+        self.torrent.with_chunk_tracker(|ct| {
+            let have = ct.get_have_pieces().as_slice()[piece.get() as usize];
+            if !have {
+                self.streams
+                    .register_waker(self.stream_id, cx.waker().clone());
+            }
+            have
+        })
+    }
+
     pub fn position(&self) -> u64 {
         self.position
     }

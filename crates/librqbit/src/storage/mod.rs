@@ -177,6 +177,15 @@ pub trait TorrentStorage: Send + Sync {
     fn on_piece_completed(&self, _piece_index: ValidPieceIndex) -> anyhow::Result<()> {
         Ok(())
     }
+
+    /// Callback called from [`ManagedTorrent::invalidate_pieces`](crate::ManagedTorrent::invalidate_pieces)
+    /// for each completed piece, before the torrent marks it missing. The storage may drop the
+    /// piece's data here: the torrent's state lock is held, so a reader that finds the data
+    /// gone sees the piece as missing once it checks again. Returning an error keeps the
+    /// piece completed. Default implementation does nothing.
+    fn on_piece_invalidated(&self, _piece_index: ValidPieceIndex) -> anyhow::Result<()> {
+        Ok(())
+    }
 }
 
 impl<U: TorrentStorage + ?Sized> TorrentStorage for Box<U> {
@@ -223,6 +232,10 @@ impl<U: TorrentStorage + ?Sized> TorrentStorage for Box<U> {
 
     fn on_piece_completed(&self, piece_id: ValidPieceIndex) -> anyhow::Result<()> {
         (**self).on_piece_completed(piece_id)
+    }
+
+    fn on_piece_invalidated(&self, piece_id: ValidPieceIndex) -> anyhow::Result<()> {
+        (**self).on_piece_invalidated(piece_id)
     }
 }
 

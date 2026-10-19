@@ -21,7 +21,7 @@ use bytes::Bytes;
 use futures::FutureExt;
 use futures::future::BoxFuture;
 use librqbit_core::hash_id::Id20;
-use librqbit_core::lengths::Lengths;
+use librqbit_core::lengths::{Lengths, ValidPieceIndex};
 
 use librqbit_core::spawn_utils::spawn_with_cancel;
 use librqbit_core::torrent_metainfo::ValidatedTorrentMetaV1Info;
@@ -470,6 +470,25 @@ impl ManagedTorrent {
 
     pub fn is_paused(&self) -> bool {
         self.locked.read().paused
+    }
+
+    /// Mark completed pieces as missing, for a storage that no longer holds their data, so that
+    /// they are downloaded again when needed. Works whether the torrent is live or paused.
+    ///
+    /// For each piece the torrent has, the storage is told through
+    /// [`TorrentStorage::on_piece_invalidated`](crate::storage::TorrentStorage::on_piece_invalidated)
+    /// and may drop the data then; a piece the storage refuses to drop stays completed.
+    /// Pieces the torrent doesn't have are skipped. Returns the number of pieces marked missing.
+    ///
+    /// Peers already told about these pieces are not told otherwise, and requests for them are
+    /// refused, so this suits torrents that don't upload.
+    pub fn invalidate_pieces(&self, pieces: &[ValidPieceIndex]) -> anyhow::Result<usize> {
+        let mut g = self.locked.write();
+        match &mut g.state {
+            ManagedTorrentState::Live(live) => live.invalidate_pieces(pieces),
+            ManagedTorrentState::Paused(paused) => Ok(paused.invalidate_pieces(pieces)),
+            s => bail!("can't invalidate pieces of a torrent in {} state", s.name()),
+        }
     }
 
     /// Pause the torrent if it's live.

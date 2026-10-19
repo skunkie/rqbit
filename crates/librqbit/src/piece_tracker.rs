@@ -234,6 +234,12 @@ impl PieceTracker {
         self.chunks.mark_piece_downloaded(piece);
     }
 
+    /// Mark a piece we have as missing again - requeues the piece if it's selected.
+    /// Returns false if we didn't have it.
+    pub fn mark_piece_missing(&mut self, piece: ValidPieceIndex, file_infos: &FileInfos) -> bool {
+        self.chunks.mark_piece_missing(piece, file_infos)
+    }
+
     /// Mark piece as failed after hash verification failure - requeues the piece.
     pub fn mark_piece_hash_failed(&mut self, piece: ValidPieceIndex) {
         self.chunks.mark_piece_broken_if_not_have(piece);

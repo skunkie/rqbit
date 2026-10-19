@@ -853,19 +853,6 @@ impl TorrentStateLive {
         }
         let mut g = self.lock_write("on_piece_completed");
         let locked = &mut **g;
-        let pieces = locked.get_pieces_mut()?;
-
-        // if we have all the pieces of the file, reopen it read only
-        for (idx, file_info) in self
-            .metadata
-            .file_infos
-            .iter()
-            .enumerate()
-            .skip_while(|(_, fi)| !fi.piece_range.contains(&id.get()))
-            .take_while(|(_, fi)| fi.piece_range.contains(&id.get()))
-        {
-            let _remaining = pieces.update_file_have_on_piece_completed(id, idx, file_info);
-        }
 
         self.streams
             .wake_streams_on_piece_completed(id, self.metadata.lengths());
@@ -906,6 +893,59 @@ impl TorrentStateLive {
                 let _ = l.tx.send(WriterRequest::Disconnect(Ok(())));
             }
         }
+    }
+
+    // Marks a verified piece as had, together with the files it belongs to, so that
+    // invalidate_pieces() never sees one counted without the other.
+    fn mark_piece_hash_ok(&self, pieces: &mut PieceTracker, id: ValidPieceIndex) {
+        pieces.mark_piece_hash_ok(id);
+        for (idx, file_info) in self
+            .metadata
+            .file_infos
+            .iter()
+            .enumerate()
+            .skip_while(|(_, fi)| !fi.piece_range.contains(&id.get()))
+            .take_while(|(_, fi)| fi.piece_range.contains(&id.get()))
+        {
+            let _remaining = pieces.update_file_have_on_piece_completed(id, idx, file_info);
+        }
+    }
+
+    pub(crate) fn invalidate_pieces(&self, pieces: &[ValidPieceIndex]) -> anyhow::Result<usize> {
+        let mut invalidated = 0;
+        {
+            let mut g = self.lock_write("invalidate_pieces");
+            let locked = &mut **g;
+            for &id in pieces {
+                let tracker = locked.get_pieces_mut()?;
+                if !tracker.chunks().is_piece_have(id) {
+                    continue;
+                }
+                if let Err(e) = self.files.on_piece_invalidated(id) {
+                    debug!(
+                        ?id,
+                        "file storage kept the piece in on_piece_invalidated(): {e:#}"
+                    );
+                    continue;
+                }
+                tracker.mark_piece_missing(id, &self.metadata.file_infos);
+                let len = self.metadata.lengths().piece_length(id) as u64;
+                self.stats.have_bytes.fetch_sub(len, Ordering::Relaxed);
+                locked.unflushed_bitv_bytes += len;
+                invalidated += 1;
+            }
+            if invalidated > 0 {
+                locked.try_flush_bitv(&self.shared, true);
+            }
+        }
+        if invalidated > 0 {
+            // Wake peers waiting for something to request, and bring back the ones
+            // dropped as not needed once the torrent finished. The peer table is touched
+            // with the state lock released, as in update_only_files().
+            self.new_pieces_notify.notify_waiters();
+            self.reconnect_all_not_needed_peers();
+        }
+        Ok(invalidated)
     }
 
     pub(crate) fn reconnect_all_not_needed_peers(&self) {
@@ -1645,6 +1685,8 @@ impl PeerHandler {
         };
 
         loop {
+            // Created before the check, so that invalidated pieces arriving after it still wake us.
+            let pieces_invalidated = self.state.new_pieces_notify.notified();
             // If we have full torrent, we don't need to request more pieces.
             // However we might still need to seed them to the peer.
             if self.state.is_finished_and_no_active_streams() {
@@ -1667,8 +1709,8 @@ impl PeerHandler {
                     return Ok(());
                 } else {
                     // TODO: wait for a notification of interest, e.g. update of selected files or new streams or change
-                    // in peer interest.
-                    tokio::time::sleep(Duration::from_secs(5)).await;
+                    // in peer interest. Invalidated pieces already wake us.
+                    let _ = tokio::time::timeout(Duration::from_secs(5), pieces_invalidated).await;
                     continue;
                 }
             }
@@ -1935,8 +1977,7 @@ impl PeerHandler {
                 true => {
                     {
                         let mut g = state.lock_write("mark_piece_downloaded");
-                        g.get_pieces_mut()?
-                            .mark_piece_hash_ok(chunk_info.piece_index);
+                        state.mark_piece_hash_ok(g.get_pieces_mut()?, chunk_info.piece_index);
                     }
 
                     // Global piece counters.
