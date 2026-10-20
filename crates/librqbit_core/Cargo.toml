@@ -30,7 +30,7 @@ clone_to_owned.workspace = true
 sha1w = { workspace = true, optional = true }
 itertools.workspace = true
 directories.workspace = true
-tokio-util.workspace = true
+tokio-util = { workspace = true, features = ["rt"] }
 data-encoding.workspace = true
 bytes.workspace = true
 memchr.workspace = true

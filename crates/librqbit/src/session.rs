@@ -59,7 +59,7 @@ use librqbit_core::{
     directories::get_configuration_directory,
     magnet::Magnet,
     peer_id::generate_azereus_style,
-    spawn_utils::spawn_with_cancel,
+    spawn_utils::{spawn_with_cancel_in, tracked},
     torrent_metainfo::{TorrentMetaV1Owned, ValidatedTorrentMetaV1Info},
 };
 use librqbit_lsd::{LocalServiceDiscovery, LocalServiceDiscoveryOptions};
@@ -68,7 +68,10 @@ use parking_lot::RwLock;
 use peer_binary_protocol::Handshake;
 use serde::{Deserialize, Serialize};
 use tokio::sync::Notify;
-use tokio_util::sync::{CancellationToken, DropGuard};
+use tokio_util::{
+    sync::{CancellationToken, DropGuard},
+    task::TaskTracker,
+};
 use tracing::{Instrument, debug, debug_span, error, info, trace, warn};
 use tracker_comms::{TrackerComms, UdpTrackerClient};
 
@@ -124,6 +127,9 @@ pub struct Session {
     // Lifecycle management
     cancellation_token: CancellationToken,
     _cancellation_token_drop_guard: DropGuard,
+    // Every task the session and its torrents spawn, so stop() can wait for
+    // them to end.
+    pub(crate) tasks: TaskTracker,
 
     // Runtime settings
     output_folder: PathBuf,
@@ -586,7 +592,10 @@ impl Session {
         default_output_folder: PathBuf,
         mut opts: SessionOptions,
     ) -> BoxFuture<'static, anyhow::Result<Arc<Self>>> {
-        async move {
+        // The listeners, the DHT, and the tracker clients spawn their tasks
+        // while the session is created; the scope tracks them.
+        let tasks = TaskTracker::new();
+        tracked(tasks.clone(), async move {
             let peer_id = opts
                 .peer_id
                 .unwrap_or_else(|| generate_azereus_style(*b"rQ", crate_version!()));
@@ -806,6 +815,7 @@ impl Session {
                 db: RwLock::new(Default::default()),
                 _cancellation_token_drop_guard: token.clone().drop_guard(),
                 cancellation_token: token,
+                tasks,
                 announce_port: listen_result.as_ref().and_then(|l| l.announce_port),
                 listen_addr: listen_result.as_ref().map(|l| l.addr),
                 default_storage_factory: opts.default_storage_factory,
@@ -914,7 +924,7 @@ impl Session {
             session.start_speed_estimator_updater();
 
             Ok(session)
-        }
+        })
         .boxed()
     }
 
@@ -1072,7 +1082,13 @@ impl Session {
         name: impl Into<Cow<'static, str>>,
         fut: impl std::future::Future<Output = anyhow::Result<()>> + Send + 'static,
     ) {
-        spawn_with_cancel(span, name, self.cancellation_token.clone(), fut);
+        spawn_with_cancel_in(
+            &self.tasks,
+            span,
+            name,
+            self.cancellation_token.clone(),
+            fut,
+        );
     }
 
     pub(crate) fn rs(&self) -> Option<tracing::Id> {
@@ -1094,8 +1110,9 @@ impl Session {
             }
         }
         self.cancellation_token.cancel();
-        // this sucks, but hopefully will be enough
-        tokio::time::sleep(Duration::from_secs(1)).await;
+        // Every task the session spawned ends on cancellation.
+        self.tasks.close();
+        self.tasks.wait().await;
     }
 
     /// Run a callback given the currently managed torrents.
@@ -1113,7 +1130,7 @@ impl Session {
         add: AddTorrent<'a>,
         opts: Option<AddTorrentOptions>,
     ) -> BoxFuture<'a, anyhow::Result<AddTorrentResponse>> {
-        async move {
+        let fut = async move {
             let mut opts = opts.unwrap_or_default();
             let add_res = match add {
                 AddTorrent::Url(magnet)
@@ -1193,9 +1210,12 @@ impl Session {
             };
 
             self.add_torrent_internal(add_res, opts).await
-        }
-        .instrument(debug_span!(parent: self.rs(), "add_torrent"))
-        .boxed()
+        };
+        // Retrieving metadata and starting the torrent spawn tasks from the
+        // caller's task; the scope tracks them.
+        tracked(self.tasks.clone(), fut)
+            .instrument(debug_span!(parent: self.rs(), "add_torrent"))
+            .boxed()
     }
 
     fn get_default_subfolder_for_torrent(
@@ -1647,10 +1667,14 @@ impl Session {
     }
 
     pub async fn unpause(self: &Arc<Self>, handle: &ManagedTorrentHandle) -> anyhow::Result<()> {
-        let peer_rx = self.make_peer_rx_managed_torrent(handle, true);
-        handle.start(peer_rx, false)?;
-        self.try_update_persistence_metadata(handle).await;
-        Ok(())
+        // Starting spawns the torrent's tasks from the caller's task.
+        tracked(self.tasks.clone(), async {
+            let peer_rx = self.make_peer_rx_managed_torrent(handle, true);
+            handle.start(peer_rx, false)?;
+            self.try_update_persistence_metadata(handle).await;
+            Ok(())
+        })
+        .await
     }
 
     pub async fn update_only_files(

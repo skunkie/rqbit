@@ -23,7 +23,7 @@ use futures::future::BoxFuture;
 use librqbit_core::hash_id::Id20;
 use librqbit_core::lengths::{Lengths, ValidPieceIndex};
 
-use librqbit_core::spawn_utils::spawn_with_cancel;
+use librqbit_core::spawn_utils::{spawn_with_cancel, spawn_with_cancel_in};
 use librqbit_core::torrent_metainfo::ValidatedTorrentMetaV1Info;
 pub use live::*;
 use parking_lot::RwLock;
@@ -364,7 +364,8 @@ impl ManagedTorrent {
                     let span = t.shared().span.clone();
                     let token = token.clone();
 
-                    spawn_with_cancel(
+                    spawn_with_cancel_in(
+                        &session.tasks.clone(),
                         debug_span!(parent: span.clone(), "initialize_and_start"),
                         "initialize_and_start",
                         token.clone(),

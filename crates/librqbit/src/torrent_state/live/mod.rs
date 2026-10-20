@@ -62,7 +62,7 @@ use librqbit_core::{
     constants::CHUNK_SIZE,
     hash_id::Id20,
     lengths::{ChunkInfo, Lengths, ValidPieceIndex},
-    spawn_utils::spawn_with_cancel,
+    spawn_utils::{spawn_with_cancel, spawn_with_cancel_in},
     speed_estimator::SpeedEstimator,
     torrent_metainfo::ValidatedTorrentMetaV1Info,
 };
@@ -358,7 +358,18 @@ impl TorrentStateLive {
         name: impl Into<Cow<'static, str>>,
         fut: impl std::future::Future<Output = crate::Result<()>> + Send + 'static,
     ) {
-        spawn_with_cancel(span, name, self.cancellation_token.clone(), fut);
+        // The session tracks the torrent's tasks, so stopping it waits for
+        // them.
+        match self.shared.session.upgrade() {
+            Some(session) => spawn_with_cancel_in(
+                &session.tasks,
+                span,
+                name,
+                self.cancellation_token.clone(),
+                fut,
+            ),
+            None => spawn_with_cancel(span, name, self.cancellation_token.clone(), fut),
+        };
     }
 
     pub fn down_speed_estimator(&self) -> &SpeedEstimator {
