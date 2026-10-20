@@ -87,6 +87,14 @@ pub struct PeerConnectionOptions {
     /// one at a stream's read position after a seek, is requested only after
     /// those, so a smaller window makes streams react faster to seeks.
     pub max_request_window: Option<usize>,
+
+    /// How long a peer may hold chunk requests without delivering any before
+    /// it is disconnected, which returns its in-flight pieces to the queue
+    /// (default: never). A peer that keeps the connection alive, or keeps us
+    /// choked, while it sends nothing would otherwise hold its partial
+    /// pieces, and the storage room reserved for them, indefinitely.
+    #[serde_as(as = "Option<serde_with::DurationSeconds>")]
+    pub request_stall_timeout: Option<Duration>,
 }
 
 pub(crate) struct PeerConnection<H> {

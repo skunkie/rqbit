@@ -1058,6 +1058,9 @@ impl Session {
             max_request_window: other
                 .max_request_window
                 .or(self.peer_opts.max_request_window),
+            request_stall_timeout: other
+                .request_stall_timeout
+                .or(self.peer_opts.request_stall_timeout),
         }
     }
 
@@ -1374,6 +1377,7 @@ impl Session {
                     peer_connect_timeout: peer_opts.connect_timeout,
                     peer_read_write_timeout: peer_opts.read_write_timeout,
                     peer_max_request_window: peer_opts.max_request_window,
+                    peer_request_stall_timeout: peer_opts.request_stall_timeout,
                     allow_overwrite: opts.overwrite,
                     output_folder,
                     ratelimits: opts.ratelimits,

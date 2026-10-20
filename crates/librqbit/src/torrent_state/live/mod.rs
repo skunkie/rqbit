@@ -1057,6 +1057,9 @@ const DEFAULT_PEER_REQUEST_WINDOW: usize = 128;
 struct PeerFlowControl {
     i_am_choked: bool,
     request_window: usize,
+    // When the peer last delivered a requested chunk, or was first asked for
+    // one while it had none in flight.
+    last_delivery: Instant,
 }
 
 impl PeerFlowControl {
@@ -1064,6 +1067,7 @@ impl PeerFlowControl {
         Self {
             i_am_choked: true,
             request_window: max_request_window,
+            last_delivery: Instant::now(),
         }
     }
 }
@@ -1678,17 +1682,46 @@ impl PeerHandler {
         .await;
     }
 
-    async fn wait_for_request_slot(&self) {
+    async fn wait_for_request_slot(&self) -> crate::Result<()> {
         loop {
             let Some(notify) = self.request_slots_changed() else {
-                return;
+                return Ok(());
             };
             let notified = notify.notified();
             if self.can_send_request() {
-                return;
+                return Ok(());
             }
-            notified.await;
+            self.check_stalled()?;
+            match self.time_until_stalled() {
+                // Wakes up to check again when the peer would have stalled.
+                Some(remaining) => {
+                    let _ = tokio::time::timeout(remaining, notified).await;
+                }
+                None => notified.await,
+            }
         }
+    }
+
+    /// Returns how long the peer may still hold requests without delivering
+    /// a chunk, if a stall timeout is set and it holds any.
+    fn time_until_stalled(&self) -> Option<Duration> {
+        let limit = self.state.shared.options.peer_request_stall_timeout?;
+        if self.requested_inflight_count().unwrap_or_default() == 0 {
+            return None;
+        }
+        let since = self.lock_flow_control("time_until_stalled").last_delivery;
+        Some(limit.saturating_sub(since.elapsed()))
+    }
+
+    /// Fails once the peer has held requests for the stall timeout without
+    /// delivering any chunk. Ending the requester disconnects the peer, which
+    /// returns its in-flight pieces to the queue.
+    fn check_stalled(&self) -> crate::Result<()> {
+        if self.time_until_stalled() == Some(Duration::ZERO) {
+            debug!("peer delivered no requested chunk within the stall timeout, disconnecting");
+            return Err(Error::Timeout("peer delivered no requested chunk"));
+        }
+        Ok(())
     }
 
     // The job of this is to request chunks and also to keep peer alive.
@@ -1746,7 +1779,8 @@ impl PeerHandler {
             }
 
             update_interest(self, true)?;
-            aframe!(self.wait_for_request_slot()).await;
+            self.check_stalled()?;
+            aframe!(self.wait_for_request_slot()).await?;
 
             // Acquire a piece using the strategy: try steal (10x) → reserve → steal (3x).
             let new_piece_notify = self.state.new_pieces_notify.notified();
@@ -1775,7 +1809,7 @@ impl PeerHandler {
                     length: chunk.size,
                 };
 
-                aframe!(self.wait_for_request_slot()).await;
+                aframe!(self.wait_for_request_slot()).await?;
 
                 self.state
                     .ratelimits
@@ -1789,16 +1823,23 @@ impl PeerHandler {
                         .await?;
                 }
 
-                aframe!(self.wait_for_request_slot()).await;
+                aframe!(self.wait_for_request_slot()).await?;
 
                 match self
                     .state
                     .peers
                     .with_live_mut(handle, "add chunk request", |live| {
-                        live.add_inflight_request(chunk)
+                        let idle = live.requested_inflight_count() == 0;
+                        (live.add_inflight_request(chunk), idle)
                     }) {
-                    Some(true) => {}
-                    Some(false) => {
+                    Some((true, idle)) => {
+                        // A peer is measured from its first request, not
+                        // from its last delivery before it went idle.
+                        if idle {
+                            self.lock_flow_control("first request").last_delivery = Instant::now();
+                        }
+                    }
+                    Some((false, _)) => {
                         // This request was already in-flight for this peer for this chunk.
                         // This might happen in theory, but not very likely.
                         //
@@ -1890,6 +1931,8 @@ impl PeerHandler {
         if !should_process {
             return Ok(());
         }
+
+        self.lock_flow_control("chunk delivered").last_delivery = Instant::now();
 
         // This one is used to calculate download speed.
         self.state
