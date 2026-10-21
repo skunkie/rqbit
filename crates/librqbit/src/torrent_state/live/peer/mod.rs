@@ -85,6 +85,17 @@ impl Peer {
             None
         }
     }
+
+    /// Queues a dead peer that can be dialed, resetting its backoff.
+    pub(crate) fn reconnect_dead_peer(&mut self, counters: &PeerStates) -> Option<SocketAddr> {
+        if !matches!(self.get_state(), PeerState::Dead) {
+            return None;
+        }
+        let socket_addr = self.outgoing_address?;
+        self.stats.reset_backoff();
+        self.set_state(PeerState::Queued, counters);
+        Some(socket_addr)
+    }
 }
 
 #[derive(Debug, Default)]

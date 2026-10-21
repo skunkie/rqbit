@@ -508,6 +508,7 @@ impl TorrentStateLive {
         let options = PeerConnectionOptions {
             connect_timeout: self.shared.options.peer_connect_timeout,
             read_write_timeout: self.shared.options.peer_read_write_timeout,
+            keep_alive_interval: self.shared.options.peer_keep_alive_interval,
             ..Default::default()
         };
         let peer_connection = PeerConnection::new(
@@ -573,6 +574,7 @@ impl TorrentStateLive {
         let options = PeerConnectionOptions {
             connect_timeout: state.shared.options.peer_connect_timeout,
             read_write_timeout: state.shared.options.peer_read_write_timeout,
+            keep_alive_interval: state.shared.options.peer_keep_alive_interval,
             ..Default::default()
         };
         let peer_connection = PeerConnection::new(
@@ -966,6 +968,18 @@ impl TorrentStateLive {
 
     pub(crate) fn reselect_pieces(&self) {
         self.new_pieces_notify.notify_waiters();
+    }
+
+    /// Queue every dead outgoing peer now, resetting its backoff. Its
+    /// waiting task then finds it queued and leaves it be.
+    pub(crate) fn reconnect_dead_peers(&self) {
+        self.peers
+            .states
+            .iter_mut()
+            .filter_map(|mut p| p.value_mut().reconnect_dead_peer(&self.peers))
+            .map(|socket_addr| self.peer_queue_tx.send(socket_addr))
+            .take_while(|r| r.is_ok())
+            .last();
     }
 
     pub(crate) fn reconnect_all_not_needed_peers(&self) {

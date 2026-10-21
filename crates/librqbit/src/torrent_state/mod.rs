@@ -113,6 +113,7 @@ pub(crate) struct ManagedTorrentOptions {
     pub force_tracker_interval: Option<Duration>,
     pub peer_connect_timeout: Option<Duration>,
     pub peer_read_write_timeout: Option<Duration>,
+    pub peer_keep_alive_interval: Option<Duration>,
     pub peer_max_request_window: Option<usize>,
     pub peer_request_stall_timeout: Option<Duration>,
     pub allow_overwrite: bool,
@@ -477,6 +478,17 @@ impl ManagedTorrent {
     pub fn reselect_pieces(&self) {
         if let Some(live) = self.live() {
             live.reselect_pieces();
+        }
+    }
+
+    /// Reconnect at once the peers that died and wait out a backoff, and
+    /// those dropped as not needed, for a stream that needs data now. A
+    /// torrent without streams can lose its peers to idle timeouts, and
+    /// otherwise its next stream waits for the backoff to end.
+    pub fn reconnect_peers(&self) {
+        if let Some(live) = self.live() {
+            live.reconnect_dead_peers();
+            live.reconnect_all_not_needed_peers();
         }
     }
 
