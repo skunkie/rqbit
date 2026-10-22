@@ -1933,7 +1933,16 @@ impl PeerHandler {
             .lock_write("claim_chunk")
             .get_pieces_mut()?
             .claim_chunk(piece, self.addr);
-        Ok(claimed.and_then(|index| self.state.lengths.iter_chunk_infos(piece).nth(index)))
+        match claimed {
+            Some((index, duplicate)) => {
+                trace!(%piece, chunk = index, duplicate, "claimed chunk");
+                Ok(self.state.lengths.iter_chunk_infos(piece).nth(index))
+            }
+            None => {
+                trace!(%piece, "nothing left to claim");
+                Ok(None)
+            }
+        }
     }
 
     fn on_i_am_choked(&self) {
@@ -1947,6 +1956,7 @@ impl PeerHandler {
             Ok(pieces) => pieces.leave_shared_pieces(self.addr),
             Err(_) => Vec::new(),
         };
+        debug!(?left, "we are choked, leaving shared pieces");
         // The torrent's lock is released first: peers lock before it.
         if !left.is_empty() {
             self.state

@@ -427,16 +427,22 @@ impl PieceTracker {
     }
 
     /// Claims the next chunk of `piece` for `peer` to request, as
-    /// [`InflightPiece::next_claim`] chooses it. Returns `None` once `peer`
+    /// [`InflightPiece::next_claim`] chooses it, and whether another
+    /// participant requested it too. Returns `None` once `peer`
     /// no longer takes part in the piece or has nothing left to request.
-    pub fn claim_chunk(&mut self, piece: ValidPieceIndex, peer: PeerHandle) -> Option<usize> {
+    pub fn claim_chunk(
+        &mut self,
+        piece: ValidPieceIndex,
+        peer: PeerHandle,
+    ) -> Option<(usize, bool)> {
         let info = self.inflight.get_mut(&piece)?;
         if !info.is_participant(peer) {
             return None;
         }
         let chunk = info.next_claim(&self.chunks, piece, peer)?;
+        let duplicate = info.claims[chunk].iter().any(Option::is_some);
         info.claim(chunk, peer);
-        Some(chunk)
+        Some((chunk, duplicate))
     }
 
     /// The participants other than `peer` that requested `chunk` of `piece`,
@@ -707,7 +713,7 @@ mod tests {
         who: &[PeerHandle],
     ) -> Vec<Option<usize>> {
         who.iter()
-            .map(|peer| tracker.claim_chunk(piece, *peer))
+            .map(|peer| tracker.claim_chunk(piece, *peer).map(|(chunk, _)| chunk))
             .collect()
     }
 
@@ -783,7 +789,7 @@ mod tests {
         );
         assert_eq!(
             tracker.claim_chunk(piece_0, peer(2)),
-            Some(1),
+            Some((1, true)),
             "with one request left, the joiner duplicates another"
         );
         assert!(
