@@ -418,9 +418,11 @@ impl PieceTracker {
         })
     }
 
-    /// Reserves the most urgent shared piece not yet in flight, or joins one
-    /// in flight that `req.peer` can help fetch. A participant comes back to
-    /// a shared piece it has requests left to make in.
+    /// Reserves the most urgent shared piece not yet in flight; failing that,
+    /// joins the most urgent one in flight with a chunk no one requested, and
+    /// failing that, one whose request `req.peer` can duplicate. A
+    /// participant comes back to a shared piece it has requests left to make
+    /// in.
     fn try_shared<I, P, S, R>(
         &mut self,
         req: &mut AcquireRequest<I, P, S, R>,
@@ -431,42 +433,62 @@ impl PieceTracker {
         S: Fn(ValidPieceIndex) -> bool,
         R: FnMut(ValidPieceIndex) -> bool,
     {
+        let wanted = |tracker: &Self, piece: ValidPieceIndex| {
+            !tracker.chunks.is_piece_have(piece) && (req.peer_has_piece)(piece)
+        };
+        // Every reader's piece gets an owner before any gets helpers, so a
+        // reader whose pieces come later in the list is not starved by
+        // earlier ones that always have chunks left.
         for &piece in req.shared_pieces {
-            if self.chunks.is_piece_have(piece) || !(req.peer_has_piece)(piece) {
+            if wanted(self, piece)
+                && !self.inflight.contains_key(&piece)
+                && (req.can_reserve)(piece)
+            {
+                let reserved = self.reserve_piece(piece, req.peer);
+                if !self.unshareable.contains(&piece)
+                    && let Some(info) = self.inflight.get_mut(&piece)
+                {
+                    info.shared = true;
+                }
+                return Some(reserved);
+            }
+        }
+        // Then help with a chunk no one requested, and only then duplicate one.
+        let mut duplicate = None;
+        for &piece in req.shared_pieces {
+            if !wanted(self, piece) || self.unshareable.contains(&piece) {
                 continue;
             }
-            let Some(info) = self.inflight.get_mut(&piece) else {
-                if (req.can_reserve)(piece) {
-                    let reserved = self.reserve_piece(piece, req.peer);
-                    if !self.unshareable.contains(&piece)
-                        && let Some(info) = self.inflight.get_mut(&piece)
-                    {
-                        info.shared = true;
-                    }
-                    return Some(reserved);
-                }
+            let Some(info) = self.inflight.get(&piece) else {
                 continue;
             };
-            if self.unshareable.contains(&piece) {
+            if !info.is_participant(req.peer) && info.joiners.len() + 1 >= MAX_SHARED_PARTICIPANTS {
                 continue;
             }
-            let participant = info.is_participant(req.peer);
-            if !participant && info.joiners.len() + 1 >= MAX_SHARED_PARTICIPANTS {
-                continue;
+            match info.next_claim(&self.chunks, piece, req.peer) {
+                ChunkClaim::Chunk {
+                    duplicate: false, ..
+                } => return Some(self.join_shared(piece, req.peer)),
+                ChunkClaim::Chunk {
+                    duplicate: true, ..
+                } => {
+                    duplicate.get_or_insert(piece);
+                }
+                ChunkClaim::Full | ChunkClaim::Done => {}
             }
-            if !matches!(
-                info.next_claim(&self.chunks, piece, req.peer),
-                ChunkClaim::Chunk { .. }
-            ) {
-                continue;
-            }
-            if !participant {
-                info.joiners.push(req.peer);
-                info.shared = true;
-            }
-            return Some(AcquireResult::Joined(piece));
         }
-        None
+        duplicate.map(|piece| self.join_shared(piece, req.peer))
+    }
+
+    /// Makes `peer` a participant of the in-flight shared `piece`.
+    fn join_shared(&mut self, piece: ValidPieceIndex, peer: PeerHandle) -> AcquireResult {
+        if let Some(info) = self.inflight.get_mut(&piece)
+            && !info.is_participant(peer)
+        {
+            info.joiners.push(peer);
+            info.shared = true;
+        }
+        AcquireResult::Joined(piece)
     }
 
     /// Claims the next chunk of `piece` for `peer` to request, as
@@ -914,6 +936,69 @@ mod tests {
             claims(&mut tracker, piece_1, &[peer(3); 64]),
             (0..64).map(Some).collect::<Vec<_>>(),
             "a piece not shared is requested whole"
+        );
+    }
+
+    #[test]
+    fn every_shared_piece_gets_an_owner_before_any_gets_helpers() {
+        let (mut tracker, file_infos) = make_tracker(2, 64);
+        let piece_0 = first_piece(&tracker);
+        let piece_1 = tracker
+            .chunks()
+            .get_lengths()
+            .validate_piece_index(1)
+            .unwrap();
+        let shared = [piece_0, piece_1];
+        acquire_with(&mut tracker, &file_infos, peer(1), &[], &shared);
+        claims(&mut tracker, piece_0, &[peer(1); 16]);
+        assert!(
+            matches!(
+                acquire_with(&mut tracker, &file_infos, peer(2), &[], &shared),
+                AcquireResult::Reserved(p) if p == piece_1
+            ),
+            "a later reader's piece is reserved though the first has chunks left"
+        );
+        assert!(matches!(
+            acquire_with(&mut tracker, &file_infos, peer(3), &[], &shared),
+            AcquireResult::Joined(p) if p == piece_0
+        ));
+    }
+
+    #[test]
+    fn a_free_chunk_is_helped_with_before_a_request_is_duplicated() {
+        let (mut tracker, file_infos) = make_four_chunk_tracker(2);
+        let piece_0 = first_piece(&tracker);
+        let piece_1 = tracker
+            .chunks()
+            .get_lengths()
+            .validate_piece_index(1)
+            .unwrap();
+        let shared = [piece_0, piece_1];
+        acquire_with(&mut tracker, &file_infos, peer(1), &[], &shared);
+        claims(&mut tracker, piece_0, &[peer(1); 4]);
+        acquire_with(&mut tracker, &file_infos, peer(3), &[], &shared);
+        claims(&mut tracker, piece_1, &[peer(3); 2]);
+        assert!(
+            matches!(
+                acquire_with(&mut tracker, &file_infos, peer(2), &[], &shared),
+                AcquireResult::Joined(p) if p == piece_1
+            ),
+            "the second piece has chunks no one requested; the first only duplicates"
+        );
+        assert_eq!(
+            tracker.claim_chunk(piece_1, peer(2)),
+            ChunkClaim::Chunk {
+                index: 3,
+                duplicate: false
+            }
+        );
+        claims(&mut tracker, piece_1, &[peer(2)]);
+        assert!(
+            matches!(
+                acquire_with(&mut tracker, &file_infos, peer(2), &[], &shared),
+                AcquireResult::Joined(p) if p == piece_0
+            ),
+            "with no free chunk left, the most urgent piece's request is duplicated"
         );
     }
 
