@@ -174,8 +174,9 @@ impl PieceTracker {
     ///
     /// The acquisition strategy is:
     /// 1. Try to steal a piece from a peer that's 10x slower
-    /// 2. Try to reserve a piece from the queue (priority pieces first)
-    /// 3. Try to join a shared piece with chunks no participant requested
+    /// 2. Go through the shared pieces, most urgent first: reserve one not
+    ///    yet in flight, or join one in flight that has chunks left to take
+    /// 3. Try to reserve a piece from the queue (priority pieces first)
     /// 4. Try to steal a piece from a peer that's 3x slower
     ///
     /// If `Stolen` is returned, the caller MUST call `peers.on_steal()` to notify
@@ -195,7 +196,13 @@ impl PieceTracker {
             return result;
         }
 
-        // 2. Try reserve from priority_pieces then queued pieces
+        // 2. The shared pieces come first, joined rather than passed over, so
+        // a free peer helps the most urgent piece before starting a later one.
+        if let Some(result) = self.try_shared(&mut req) {
+            return result;
+        }
+
+        // 3. Try reserve from priority_pieces then queued pieces
         // First check priority pieces that aren't already downloaded or in-flight
         for piece in &mut req.priority_pieces {
             if !self.chunks.is_piece_have(piece)
@@ -221,11 +228,6 @@ impl PieceTracker {
             if (req.peer_has_piece)(piece) && (req.can_reserve)(piece) {
                 return self.reserve_piece(piece, req.peer);
             }
-        }
-
-        // 3. Join a shared piece
-        if let Some(result) = self.try_join(&req) {
-            return result;
         }
 
         // 4. Try steal with 3x threshold (moderately slow peer)
@@ -291,8 +293,12 @@ impl PieceTracker {
         })
     }
 
-    /// Join the first shared piece `req.peer` can help fetch.
-    fn try_join<I, P, S, R>(&mut self, req: &AcquireRequest<I, P, S, R>) -> Option<AcquireResult>
+    /// Reserves the most urgent shared piece not yet in flight, or joins one
+    /// in flight that `req.peer` can help fetch.
+    fn try_shared<I, P, S, R>(
+        &mut self,
+        req: &mut AcquireRequest<I, P, S, R>,
+    ) -> Option<AcquireResult>
     where
         I: Iterator<Item = ValidPieceIndex>,
         P: Fn(ValidPieceIndex) -> bool,
@@ -300,12 +306,18 @@ impl PieceTracker {
         R: FnMut(ValidPieceIndex) -> bool,
     {
         for &piece in req.shared_pieces {
-            if self.unshareable.contains(&piece) || !(req.peer_has_piece)(piece) {
+            if self.chunks.is_piece_have(piece) || !(req.peer_has_piece)(piece) {
                 continue;
             }
             let Some(info) = self.inflight.get_mut(&piece) else {
+                if (req.can_reserve)(piece) {
+                    return Some(self.reserve_piece(piece, req.peer));
+                }
                 continue;
             };
+            if self.unshareable.contains(&piece) {
+                continue;
+            }
             if info.is_participant(req.peer)
                 || info.joiners.len() + 1 >= MAX_SHARED_PARTICIPANTS
                 || !has_joinable_chunk(&self.chunks, piece, info)
