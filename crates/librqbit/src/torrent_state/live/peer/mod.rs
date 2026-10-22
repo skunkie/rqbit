@@ -339,7 +339,7 @@ impl LivePeerState {
         }
     }
 
-    /// Cancels one request, as when another peer took its chunk over.
+    /// Cancels one request, as when another peer's copy of the chunk arrived.
     pub fn cancel_inflight_request(&mut self, chunk: &ChunkInfo) {
         if self.inflight_requests.remove(chunk) {
             let _ = self

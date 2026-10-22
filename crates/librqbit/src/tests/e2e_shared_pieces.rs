@@ -1,4 +1,9 @@
-use std::{net::Ipv4Addr, num::NonZeroU32, sync::Arc, time::Duration};
+use std::{
+    net::Ipv4Addr,
+    num::NonZeroU32,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use anyhow::Context;
 use librqbit_core::lengths::{Lengths, ValidPieceIndex};
@@ -54,10 +59,14 @@ fn options(listen: bool) -> SessionOptions {
     }
 }
 
-/// An urgent piece offered for sharing arrives from several seeders, not
-/// only from the peer that reserved it.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_shared_piece_arrives_from_several_peers() -> anyhow::Result<()> {
+/// What fetching piece 0 from seeders with these upload limits took.
+struct FirstPiece {
+    elapsed: Duration,
+    /// The seeders that delivered any of its chunks.
+    delivering: usize,
+}
+
+async fn fetch_first_piece(upload_limits: &[u32]) -> anyhow::Result<FirstPiece> {
     setup_test_logging();
     let files = create_default_random_dir_with_torrents(1, 1024 * 1024, Some("test_e2e_shared"));
     let torrent = create_torrent(
@@ -74,7 +83,7 @@ async fn a_shared_piece_arrives_from_several_peers() -> anyhow::Result<()> {
 
     let mut seeders = Vec::new();
     let mut peers = Vec::new();
-    for _ in 0..3 {
+    for upload_bps in upload_limits {
         let seeder = Session::new_with_opts(files.path().into(), options(true)).await?;
         timeout(
             Duration::from_secs(10),
@@ -85,7 +94,7 @@ async fn a_shared_piece_arrives_from_several_peers() -> anyhow::Result<()> {
                         output_folder: Some(files.path().to_str().unwrap().to_owned()),
                         overwrite: true,
                         ratelimits: LimitsConfig {
-                            upload_bps: NonZeroU32::new(SEEDER_UPLOAD_BPS),
+                            upload_bps: NonZeroU32::new(*upload_bps),
                             download_bps: None,
                         },
                         ..Default::default()
@@ -106,6 +115,7 @@ async fn a_shared_piece_arrives_from_several_peers() -> anyhow::Result<()> {
         .context("piece 0")?;
     let client_dir = TempDir::with_prefix("test_e2e_shared_client")?;
     let client = Session::new_with_opts(client_dir.path().into(), options(false)).await?;
+    let started = Instant::now();
     let handle = client
         .add_torrent(
             AddTorrent::from_bytes(bytes),
@@ -120,7 +130,7 @@ async fn a_shared_piece_arrives_from_several_peers() -> anyhow::Result<()> {
         .into_handle()
         .context("the client torrent")?;
 
-    timeout(Duration::from_secs(20), async {
+    timeout(Duration::from_secs(30), async {
         loop {
             let done = handle
                 .live()
@@ -133,6 +143,7 @@ async fn a_shared_piece_arrives_from_several_peers() -> anyhow::Result<()> {
     })
     .await
     .context("piece 0 was not downloaded")?;
+    let elapsed = started.elapsed();
 
     let live = handle.live().context("the client torrent is live")?;
     let delivering = live
@@ -141,10 +152,6 @@ async fn a_shared_piece_arrives_from_several_peers() -> anyhow::Result<()> {
         .values()
         .filter(|peer| peer.counters.fetched_bytes > 0)
         .count();
-    assert!(
-        delivering >= 2,
-        "{delivering} peer delivered piece 0's chunks; sharing should spread it"
-    );
     assert_eq!(
         live.stats_snapshot().downloaded_and_checked_pieces,
         1,
@@ -155,5 +162,36 @@ async fn a_shared_piece_arrives_from_several_peers() -> anyhow::Result<()> {
     for seeder in seeders {
         seeder.stop().await;
     }
+    Ok(FirstPiece {
+        elapsed,
+        delivering,
+    })
+}
+
+/// An urgent piece offered for sharing arrives from several seeders, not
+/// only from the peer that reserved it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_shared_piece_arrives_from_several_peers() -> anyhow::Result<()> {
+    let fetched = fetch_first_piece(&[SEEDER_UPLOAD_BPS; 3]).await?;
+    assert!(
+        fetched.delivering >= 2,
+        "{} peer delivered piece 0's chunks; sharing should spread it",
+        fetched.delivering
+    );
+    Ok(())
+}
+
+/// A seeder far slower than the others, owner or joiner, does not hold a
+/// shared piece back: the others duplicate the chunks it was asked for.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_slow_peer_does_not_hold_back_a_shared_piece() -> anyhow::Result<()> {
+    // Alone, the slow seeder takes 16 seconds over the piece, one over each
+    // chunk; each fast one, a quarter of a second.
+    let fetched = fetch_first_piece(&[1024 * 1024, 1024 * 1024, 16 * 1024]).await?;
+    assert!(
+        fetched.elapsed < Duration::from_secs(2),
+        "piece 0 took {:?}, waiting on the slow seeder",
+        fetched.elapsed
+    );
     Ok(())
 }

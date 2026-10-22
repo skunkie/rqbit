@@ -27,6 +27,14 @@ use crate::{
 /// The most peers, its owner included, that fetch one shared piece.
 const MAX_SHARED_PARTICIPANTS: usize = 3;
 
+/// The most participants that request one chunk of a shared piece: its first
+/// claimant and one duplicate.
+const CLAIMS_PER_CHUNK: usize = 2;
+
+/// A participant requests duplicates only while it holds fewer requests in
+/// the piece than this, so duplicates stay a bounded tail of the piece.
+const DUPLICATING_BELOW: usize = 2;
+
 /// Tracks a piece currently being downloaded.
 #[derive(Debug, Clone)]
 pub struct InflightPiece {
@@ -34,8 +42,17 @@ pub struct InflightPiece {
     pub started: Instant,
     /// Peers other than the owner fetching chunks of a shared piece.
     pub joiners: Vec<PeerHandle>,
-    /// The participant that requested each chunk, until it arrives.
-    claims: Vec<Option<PeerHandle>>,
+    /// The participants that requested each chunk, until it arrives.
+    claims: Vec<[Option<Claim>; CLAIMS_PER_CHUNK]>,
+    /// The order of the next claim, so the most recent request is known.
+    next_order: u32,
+}
+
+/// A participant's request for a chunk.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Claim {
+    peer: PeerHandle,
+    order: u32,
 }
 
 impl InflightPiece {
@@ -44,7 +61,8 @@ impl InflightPiece {
             peer,
             started: Instant::now(),
             joiners: Vec::new(),
-            claims: vec![None; chunks as usize],
+            claims: vec![[None; CLAIMS_PER_CHUNK]; chunks as usize],
+            next_order: 0,
         }
     }
 
@@ -60,20 +78,93 @@ impl InflightPiece {
 
     /// Frees the chunks `peer` requested, so another participant can.
     fn release_claims_of(&mut self, peer: PeerHandle) {
-        for claim in &mut self.claims {
-            if *claim == Some(peer) {
+        for claim in self.claims.iter_mut().flatten() {
+            if claim.is_some_and(|claim| claim.peer == peer) {
                 *claim = None;
             }
         }
     }
-}
 
-/// Whether some chunk of `piece` that has not arrived is free or requested
-/// only by the owner, so a joiner can take it.
-fn has_joinable_chunk(chunks: &ChunkTracker, piece: ValidPieceIndex, info: &InflightPiece) -> bool {
-    info.claims.iter().enumerate().any(|(chunk, claim)| {
-        !chunks.is_chunk_downloaded(piece, chunk) && claim.is_none_or(|peer| peer == info.peer)
-    })
+    fn release_all_claims(&mut self) {
+        self.claims.fill([None; CLAIMS_PER_CHUNK]);
+    }
+
+    /// Removes `peer` from the participants, handing ownership to the first
+    /// joiner if `peer` owned the piece. Returns false if `peer` owned it
+    /// alone, which leaves the piece unchanged.
+    fn leave(&mut self, peer: PeerHandle) -> bool {
+        if self.peer == peer {
+            if self.joiners.is_empty() {
+                return false;
+            }
+            self.peer = self.joiners.remove(0);
+        } else {
+            self.joiners.retain(|joiner| *joiner != peer);
+        }
+        self.release_claims_of(peer);
+        true
+    }
+
+    fn claimed_by(&self, chunk: usize, peer: PeerHandle) -> bool {
+        self.claims[chunk]
+            .iter()
+            .flatten()
+            .any(|claim| claim.peer == peer)
+    }
+
+    /// The chunk `peer` would request next: the first one not downloaded and
+    /// not requested, from the last chunk backwards for a joiner. Once every
+    /// such chunk is requested, and while `peer` holds few requests here, a
+    /// duplicate of the most recent request of another participant, since it
+    /// is likely the furthest from arriving; whichever copy arrives first
+    /// completes the chunk.
+    fn next_claim(
+        &self,
+        chunks: &ChunkTracker,
+        piece: ValidPieceIndex,
+        peer: PeerHandle,
+    ) -> Option<usize> {
+        let count = self.claims.len();
+        let missing = |chunk: &usize| !chunks.is_chunk_downloaded(piece, *chunk);
+        let free =
+            |chunk: &usize| missing(chunk) && self.claims[*chunk].iter().all(Option::is_none);
+        let first_free = if peer == self.peer {
+            (0..count).find(free)
+        } else {
+            (0..count).rev().find(free)
+        };
+        if first_free.is_some() {
+            return first_free;
+        }
+        let held = (0..count)
+            .filter(|chunk| missing(chunk) && self.claimed_by(*chunk, peer))
+            .count();
+        if held >= DUPLICATING_BELOW {
+            return None;
+        }
+        (0..count)
+            .filter(|chunk| {
+                missing(chunk)
+                    && !self.claimed_by(*chunk, peer)
+                    && self.claims[*chunk].contains(&None)
+            })
+            .max_by_key(|chunk| {
+                self.claims[*chunk]
+                    .iter()
+                    .flatten()
+                    .map(|claim| claim.order)
+                    .max()
+            })
+    }
+
+    /// Records that `peer` requests `chunk`.
+    fn claim(&mut self, chunk: usize, peer: PeerHandle) {
+        let order = self.next_order;
+        if let Some(slot) = self.claims[chunk].iter_mut().find(|slot| slot.is_none()) {
+            *slot = Some(Claim { peer, order });
+            self.next_order += 1;
+        }
+    }
 }
 
 /// Result of attempting to acquire a piece.
@@ -280,9 +371,10 @@ impl PieceTracker {
 
         // Update ownership (piece stays in inflight, just changes owner).
         // The old owner's requests are cancelled; chunks already received
-        // stay, so the new owner fetches only the rest.
+        // stay, so the new owner fetches only the rest. A piece this slow may
+        // wait on a joiner too, so every request is free to make again.
         let info = self.inflight.get_mut(&piece)?;
-        info.release_claims_of(old_peer);
+        info.release_all_claims();
         info.joiners.retain(|joiner| *joiner != req.peer);
         info.peer = req.peer;
         info.started = Instant::now();
@@ -294,7 +386,8 @@ impl PieceTracker {
     }
 
     /// Reserves the most urgent shared piece not yet in flight, or joins one
-    /// in flight that `req.peer` can help fetch.
+    /// in flight that `req.peer` can help fetch. A participant comes back to
+    /// a shared piece it has requests left to make in.
     fn try_shared<I, P, S, R>(
         &mut self,
         req: &mut AcquireRequest<I, P, S, R>,
@@ -318,67 +411,64 @@ impl PieceTracker {
             if self.unshareable.contains(&piece) {
                 continue;
             }
-            if info.is_participant(req.peer)
-                || info.joiners.len() + 1 >= MAX_SHARED_PARTICIPANTS
-                || !has_joinable_chunk(&self.chunks, piece, info)
-            {
+            let participant = info.is_participant(req.peer);
+            if !participant && info.joiners.len() + 1 >= MAX_SHARED_PARTICIPANTS {
                 continue;
             }
-            info.joiners.push(req.peer);
+            if info.next_claim(&self.chunks, piece, req.peer).is_none() {
+                continue;
+            }
+            if !participant {
+                info.joiners.push(req.peer);
+            }
             return Some(AcquireResult::Joined(piece));
         }
         None
     }
 
-    /// Claims the next chunk of `piece` for `peer` to request: the first one
-    /// neither downloaded nor requested, or, if `from_end` as for a joiner,
-    /// the last one. A joiner with no such chunk left takes the owner's
-    /// last-requested chunk that has not arrived, the one furthest from
-    /// arriving, while the owner holds at least two more requests than it;
-    /// the owner it was taken from is returned, so its request can be
-    /// cancelled. Returns `None` once `peer` no longer takes part in the
-    /// piece or no chunk is left.
-    pub fn claim_chunk(
-        &mut self,
-        piece: ValidPieceIndex,
-        peer: PeerHandle,
-        from_end: bool,
-    ) -> Option<(usize, Option<PeerHandle>)> {
+    /// Claims the next chunk of `piece` for `peer` to request, as
+    /// [`InflightPiece::next_claim`] chooses it. Returns `None` once `peer`
+    /// no longer takes part in the piece or has nothing left to request.
+    pub fn claim_chunk(&mut self, piece: ValidPieceIndex, peer: PeerHandle) -> Option<usize> {
         let info = self.inflight.get_mut(&piece)?;
         if !info.is_participant(peer) {
             return None;
         }
-        let chunks = &self.chunks;
-        let missing = |chunk: &usize| !chunks.is_chunk_downloaded(piece, *chunk);
-        let count = info.claims.len();
-        let free = |chunk: &usize| info.claims[*chunk].is_none() && missing(chunk);
-        let taken = if from_end {
-            match (0..count).rev().find(free) {
-                Some(chunk) => Some((chunk, None)),
-                None => {
-                    // Only while the owner holds more requests than this
-                    // peer, so the two end up sharing the rest rather than
-                    // passing it back and forth.
-                    let outstanding = |who: PeerHandle| {
-                        (0..count)
-                            .filter(|chunk| info.claims[*chunk] == Some(who) && missing(chunk))
-                            .count()
-                    };
-                    if outstanding(info.peer) > outstanding(peer) + 1 {
-                        (0..count)
-                            .rev()
-                            .find(|chunk| info.claims[*chunk] == Some(info.peer) && missing(chunk))
-                            .map(|chunk| (chunk, Some(info.peer)))
-                    } else {
-                        None
-                    }
-                }
-            }
-        } else {
-            (0..count).find(free).map(|chunk| (chunk, None))
-        }?;
-        info.claims[taken.0] = Some(peer);
-        Some(taken)
+        let chunk = info.next_claim(&self.chunks, piece, peer)?;
+        info.claim(chunk, peer);
+        Some(chunk)
+    }
+
+    /// The participants other than `peer` that requested `chunk` of `piece`,
+    /// whose copies are no longer needed once `peer`'s arrived.
+    pub fn other_claimants(
+        &self,
+        piece: ValidPieceIndex,
+        chunk: usize,
+        peer: PeerHandle,
+    ) -> Vec<PeerHandle> {
+        self.inflight
+            .get(&piece)
+            .and_then(|info| info.claims.get(chunk))
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|claim| claim.peer)
+            .filter(|claimant| *claimant != peer)
+            .collect()
+    }
+
+    /// Removes a peer that choked us from the shared pieces it takes part
+    /// in, since it will not answer their requests, so the other
+    /// participants request its chunks. Returns those pieces, whose requests
+    /// to `peer` can be cancelled. A piece `peer` fetches alone stays its
+    /// own until stolen.
+    pub fn leave_shared_pieces(&mut self, peer: PeerHandle) -> Vec<ValidPieceIndex> {
+        self.inflight
+            .iter_mut()
+            .filter(|(_, info)| info.is_participant(peer))
+            .filter_map(|(piece, info)| info.leave(peer).then_some(*piece))
+            .collect()
     }
 
     // === PIECE COMPLETION ===
@@ -423,17 +513,7 @@ impl PieceTracker {
     pub fn release_pieces_owned_by(&mut self, peer: PeerHandle) -> Vec<ValidPieceIndex> {
         // A shared piece passes to a joiner, keeping its downloaded chunks,
         // and a joiner leaving frees only its own requests.
-        for info in self.inflight.values_mut() {
-            if !info.is_participant(peer) {
-                continue;
-            }
-            info.release_claims_of(peer);
-            if info.peer == peer && !info.joiners.is_empty() {
-                info.peer = info.joiners.remove(0);
-            } else {
-                info.joiners.retain(|joiner| *joiner != peer);
-            }
-        }
+        self.leave_shared_pieces(peer);
         // Collect pieces to release (can't modify while iterating)
         let pieces_to_release: Vec<_> = self
             .inflight
@@ -612,14 +692,34 @@ mod tests {
         })
     }
 
-    #[test]
-    fn a_shared_piece_is_fetched_from_both_ends() {
-        let (mut tracker, file_infos) = make_four_chunk_tracker(2);
-        let piece_0 = tracker
+    fn first_piece(tracker: &PieceTracker) -> ValidPieceIndex {
+        tracker
             .chunks()
             .get_lengths()
             .validate_piece_index(0)
-            .unwrap();
+            .unwrap()
+    }
+
+    /// Claims for each of `who` in turn.
+    fn claims(
+        tracker: &mut PieceTracker,
+        piece: ValidPieceIndex,
+        who: &[PeerHandle],
+    ) -> Vec<Option<usize>> {
+        who.iter()
+            .map(|peer| tracker.claim_chunk(piece, *peer))
+            .collect()
+    }
+
+    fn chunk_arrives(tracker: &mut PieceTracker, piece: ValidPieceIndex, chunk: u32) {
+        let block = [0u8; 16384];
+        tracker.mark_chunk_downloaded(&Piece::from_data(piece.get(), chunk * 16384, &block));
+    }
+
+    #[test]
+    fn a_shared_piece_is_fetched_from_both_ends() {
+        let (mut tracker, file_infos) = make_four_chunk_tracker(2);
+        let piece_0 = first_piece(&tracker);
         assert!(matches!(
             acquire_with(&mut tracker, &file_infos, peer(1), &[piece_0], &[]),
             AcquireResult::Reserved(p) if p == piece_0
@@ -635,53 +735,28 @@ mod tests {
             acquire_with(&mut tracker, &file_infos, peer(2), &[], &[piece_0]),
             AcquireResult::Joined(p) if p == piece_0
         ));
-        let mut claims = Vec::new();
-        for (who, from_end) in [(peer(1), false), (peer(2), true)].repeat(3) {
-            claims.push(
-                tracker
-                    .claim_chunk(piece_0, who, from_end)
-                    .map(|(chunk, _)| chunk),
-            );
-        }
         assert_eq!(
-            claims,
+            claims(&mut tracker, piece_0, &[peer(1), peer(2)].repeat(3)),
             [Some(0), Some(3), Some(1), Some(2), None, None],
-            "the owner goes forwards and the joiner backwards, each chunk once"
+            "the owner goes forwards and the joiner backwards, each chunk once, \
+             and with two requests each neither duplicates"
         );
         assert_eq!(
-            tracker.claim_chunk(piece_0, peer(3), false),
+            tracker.claim_chunk(piece_0, peer(3)),
             None,
             "a peer taking no part claims nothing"
-        );
-        assert!(
-            matches!(
-                acquire_with(&mut tracker, &file_infos, peer(3), &[], &[piece_0]),
-                AcquireResult::Joined(_)
-            ),
-            "a third peer joins while the owner holds requests"
-        );
-        assert_eq!(
-            tracker.claim_chunk(piece_0, peer(3), true),
-            Some((1, Some(peer(1)))),
-            "and takes over the owner's last one"
         );
     }
 
     #[test]
-    fn a_joiner_takes_over_the_owners_last_requests() {
+    fn a_peer_out_of_chunks_duplicates_the_latest_requests() {
         let (mut tracker, file_infos) = make_four_chunk_tracker(1);
-        let piece_0 = tracker
-            .chunks()
-            .get_lengths()
-            .validate_piece_index(0)
-            .unwrap();
+        let piece_0 = first_piece(&tracker);
         acquire_with(&mut tracker, &file_infos, peer(1), &[piece_0], &[]);
-        for chunk in 0..4 {
-            assert_eq!(
-                tracker.claim_chunk(piece_0, peer(1), false),
-                Some((chunk, None))
-            );
-        }
+        assert_eq!(
+            claims(&mut tracker, piece_0, &[peer(1); 4]),
+            [Some(0), Some(1), Some(2), Some(3)]
+        );
         assert!(
             matches!(
                 acquire_with(&mut tracker, &file_infos, peer(2), &[], &[piece_0]),
@@ -690,34 +765,60 @@ mod tests {
             "a piece whose chunks the owner requested can still be joined"
         );
         assert_eq!(
-            tracker.claim_chunk(piece_0, peer(2), true),
-            Some((3, Some(peer(1)))),
-            "the owner's last request is the furthest from arriving"
+            claims(&mut tracker, piece_0, &[peer(2); 3]),
+            [Some(3), Some(2), None],
+            "the joiner duplicates the owner's last two requests"
         );
         assert_eq!(
-            tracker.claim_chunk(piece_0, peer(2), true),
-            Some((2, Some(peer(1))))
-        );
-        assert_eq!(
-            tracker.claim_chunk(piece_0, peer(2), true),
+            tracker.claim_chunk(piece_0, peer(1)),
             None,
-            "with two requests each, they share the rest"
+            "the owner holds more than two requests"
+        );
+
+        chunk_arrives(&mut tracker, piece_0, 3);
+        assert_eq!(
+            tracker.other_claimants(piece_0, 3, peer(2)),
+            [peer(1)],
+            "the owner's copy can be cancelled"
         );
         assert_eq!(
-            tracker.claim_chunk(piece_0, peer(1), false),
-            None,
-            "the owner takes nothing back"
+            tracker.claim_chunk(piece_0, peer(2)),
+            Some(1),
+            "with one request left, the joiner duplicates another"
+        );
+        assert!(
+            matches!(
+                acquire_with(&mut tracker, &file_infos, peer(2), &[], &[piece_0]),
+                AcquireResult::NoneAvailable
+            ),
+            "a participant holding two requests looks elsewhere"
+        );
+    }
+
+    #[test]
+    fn a_chunk_is_requested_from_at_most_two_peers() {
+        let (mut tracker, file_infos) = make_four_chunk_tracker(1);
+        let piece_0 = first_piece(&tracker);
+        acquire_with(&mut tracker, &file_infos, peer(1), &[piece_0], &[]);
+        claims(&mut tracker, piece_0, &[peer(1); 4]);
+        for joiner in [2, 3] {
+            acquire_with(&mut tracker, &file_infos, peer(joiner), &[], &[piece_0]);
+        }
+        assert_eq!(
+            claims(&mut tracker, piece_0, &[peer(2), peer(3), peer(2), peer(3)]),
+            [Some(3), Some(2), Some(1), Some(0)],
+            "each joiner duplicates chunks the other has not"
+        );
+        assert_eq!(
+            claims(&mut tracker, piece_0, &[peer(2), peer(3)]),
+            [None, None]
         );
     }
 
     #[test]
     fn a_shared_piece_takes_at_most_three_peers() {
         let (mut tracker, file_infos) = make_four_chunk_tracker(1);
-        let piece_0 = tracker
-            .chunks()
-            .get_lengths()
-            .validate_piece_index(0)
-            .unwrap();
+        let piece_0 = first_piece(&tracker);
         acquire_with(&mut tracker, &file_infos, peer(1), &[piece_0], &[]);
         for joiner in [2, 3] {
             assert!(matches!(
@@ -732,20 +833,86 @@ mod tests {
     }
 
     #[test]
-    fn a_shared_piece_passes_to_a_joiner_when_its_owner_dies() {
-        let (mut tracker, file_infos) = make_four_chunk_tracker(1);
-        let piece_0 = tracker
+    fn a_choking_peer_leaves_its_shared_pieces() {
+        let (mut tracker, file_infos) = make_four_chunk_tracker(2);
+        let piece_0 = first_piece(&tracker);
+        let piece_1 = tracker
             .chunks()
             .get_lengths()
-            .validate_piece_index(0)
+            .validate_piece_index(1)
             .unwrap();
         acquire_with(&mut tracker, &file_infos, peer(1), &[piece_0], &[]);
         acquire_with(&mut tracker, &file_infos, peer(2), &[], &[piece_0]);
+        acquire_with(&mut tracker, &file_infos, peer(3), &[piece_1], &[]);
+        claims(&mut tracker, piece_0, &[peer(1), peer(2), peer(2)]);
+
+        assert_eq!(tracker.leave_shared_pieces(peer(2)), [piece_0]);
         assert_eq!(
-            tracker.claim_chunk(piece_0, peer(1), false),
-            Some((0, None))
+            claims(&mut tracker, piece_0, &[peer(2), peer(1), peer(1)]),
+            [None, Some(1), Some(2)],
+            "the joiner's requests are the owner's to make"
         );
-        assert_eq!(tracker.claim_chunk(piece_0, peer(2), true), Some((3, None)));
+        assert!(
+            tracker.leave_shared_pieces(peer(3)).is_empty(),
+            "a piece fetched alone waits for its peer or a steal"
+        );
+        assert_eq!(tracker.get_inflight(piece_1).unwrap().peer, peer(3));
+
+        acquire_with(&mut tracker, &file_infos, peer(2), &[], &[piece_0]);
+        assert_eq!(tracker.leave_shared_pieces(peer(1)), [piece_0]);
+        assert_eq!(
+            tracker.get_inflight(piece_0).unwrap().peer,
+            peer(2),
+            "an owner that choked hands the piece over"
+        );
+        assert_eq!(
+            claims(&mut tracker, piece_0, &[peer(2); 4]),
+            [Some(0), Some(1), Some(2), Some(3)]
+        );
+    }
+
+    #[test]
+    fn a_steal_frees_every_participants_requests() {
+        let (mut tracker, file_infos) = make_four_chunk_tracker(1);
+        let piece_0 = first_piece(&tracker);
+        acquire_with(&mut tracker, &file_infos, peer(1), &[piece_0], &[]);
+        acquire_with(&mut tracker, &file_infos, peer(2), &[], &[piece_0]);
+        claims(&mut tracker, piece_0, &[peer(1), peer(2), peer(1), peer(2)]);
+
+        let file_priorities = make_default_file_priorities(&file_infos);
+        let stolen = tracker.acquire_piece(AcquireRequest {
+            peer: peer(3),
+            peer_avg_time: Some(Duration::ZERO),
+            priority_pieces: std::iter::empty(),
+            file_priorities: &file_priorities,
+            file_infos: &file_infos,
+            peer_has_piece: |_| true,
+            can_steal: |_| true,
+            can_reserve: |_| true,
+            queued_pieces: false,
+            shared_pieces: &[],
+        });
+        assert!(matches!(
+            stolen,
+            AcquireResult::Stolen { piece, from_peer } if piece == piece_0 && from_peer == peer(1)
+        ));
+        assert_eq!(
+            claims(&mut tracker, piece_0, &[peer(3); 4]),
+            [Some(0), Some(1), Some(2), Some(3)],
+            "a joiner's requests do not hold back the new owner"
+        );
+    }
+
+    #[test]
+    fn a_shared_piece_passes_to_a_joiner_when_its_owner_dies() {
+        let (mut tracker, file_infos) = make_four_chunk_tracker(1);
+        let piece_0 = first_piece(&tracker);
+        acquire_with(&mut tracker, &file_infos, peer(1), &[piece_0], &[]);
+        acquire_with(&mut tracker, &file_infos, peer(2), &[], &[piece_0]);
+        assert_eq!(
+            claims(&mut tracker, piece_0, &[peer(1), peer(2)]),
+            [Some(0), Some(3)]
+        );
 
         assert!(
             tracker.release_pieces_owned_by(peer(1)).is_empty(),
@@ -754,26 +921,16 @@ mod tests {
         let info = tracker.get_inflight(piece_0).unwrap();
         assert_eq!((info.peer, info.joiners.len()), (peer(2), 0));
         assert_eq!(
-            tracker.claim_chunk(piece_0, peer(2), true),
-            Some((2, None)),
-            "the joiner keeps its own requests"
-        );
-        assert_eq!(tracker.claim_chunk(piece_0, peer(2), true), Some((1, None)));
-        assert_eq!(
-            tracker.claim_chunk(piece_0, peer(2), true),
-            Some((0, None)),
-            "the dead owner's request is free again"
+            claims(&mut tracker, piece_0, &[peer(2); 3]),
+            [Some(0), Some(1), Some(2)],
+            "the dead owner's request is free again, and the new owner keeps its own"
         );
     }
 
     #[test]
     fn a_shared_piece_that_failed_its_check_is_fetched_from_one_peer() {
         let (mut tracker, file_infos) = make_four_chunk_tracker(1);
-        let piece_0 = tracker
-            .chunks()
-            .get_lengths()
-            .validate_piece_index(0)
-            .unwrap();
+        let piece_0 = first_piece(&tracker);
         acquire_with(&mut tracker, &file_infos, peer(1), &[piece_0], &[]);
         acquire_with(&mut tracker, &file_infos, peer(2), &[], &[piece_0]);
         tracker.take_inflight(piece_0);
