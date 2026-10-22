@@ -35,6 +35,24 @@ const CLAIMS_PER_CHUNK: usize = 2;
 /// the piece than this, so duplicates stay a bounded tail of the piece.
 const DUPLICATING_BELOW: usize = 2;
 
+/// The most requests one participant holds in a shared piece, 256 KiB of
+/// 16 KiB chunks: enough to keep a slow link busy, few enough that the first
+/// peer to reserve a large piece leaves most of its chunks to the others.
+const SHARED_PIPELINE_CHUNKS: usize = 16;
+
+/// What a participant of an in-flight piece requests next.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChunkClaim {
+    /// This chunk, and whether another participant requested it too.
+    Chunk { index: usize, duplicate: bool },
+    /// Nothing until one of the participant's requests in the piece is
+    /// answered: it holds as many as a shared piece allows, and chunks are
+    /// left for the others.
+    Full,
+    /// Nothing more: the participant is done with the piece.
+    Done,
+}
+
 /// Tracks a piece currently being downloaded.
 #[derive(Debug, Clone)]
 pub struct InflightPiece {
@@ -46,6 +64,9 @@ pub struct InflightPiece {
     claims: Vec<[Option<Claim>; CLAIMS_PER_CHUNK]>,
     /// The order of the next claim, so the most recent request is known.
     next_order: u32,
+    /// Whether the piece is shared, so each participant holds few of its
+    /// requests at once.
+    shared: bool,
 }
 
 /// A participant's request for a chunk.
@@ -63,6 +84,7 @@ impl InflightPiece {
             joiners: Vec::new(),
             claims: vec![[None; CLAIMS_PER_CHUNK]; chunks as usize],
             next_order: 0,
+            shared: false,
         }
     }
 
@@ -112,35 +134,42 @@ impl InflightPiece {
             .any(|claim| claim.peer == peer)
     }
 
-    /// The chunk `peer` would request next: the first one not downloaded and
-    /// not requested, from the last chunk backwards for a joiner. Once every
-    /// such chunk is requested, and while `peer` holds few requests here, a
-    /// duplicate of the most recent request of another participant, since it
-    /// is likely the furthest from arriving; whichever copy arrives first
-    /// completes the chunk.
+    /// What `peer` would request next: the first chunk not downloaded and
+    /// not requested, from the last chunk backwards for a joiner, while it
+    /// holds fewer than [`SHARED_PIPELINE_CHUNKS`] requests in a shared piece.
+    /// Once every such chunk is requested, and while `peer` holds few
+    /// requests here, a duplicate of the most recent request of another
+    /// participant, since it is likely the furthest from arriving; whichever
+    /// copy arrives first completes the chunk.
     fn next_claim(
         &self,
         chunks: &ChunkTracker,
         piece: ValidPieceIndex,
         peer: PeerHandle,
-    ) -> Option<usize> {
+    ) -> ChunkClaim {
         let count = self.claims.len();
         let missing = |chunk: &usize| !chunks.is_chunk_downloaded(piece, *chunk);
         let free =
             |chunk: &usize| missing(chunk) && self.claims[*chunk].iter().all(Option::is_none);
+        let held = (0..count)
+            .filter(|chunk| missing(chunk) && self.claimed_by(*chunk, peer))
+            .count();
         let first_free = if peer == self.peer {
             (0..count).find(free)
         } else {
             (0..count).rev().find(free)
         };
-        if first_free.is_some() {
-            return first_free;
+        if let Some(index) = first_free {
+            if self.shared && held >= SHARED_PIPELINE_CHUNKS {
+                return ChunkClaim::Full;
+            }
+            return ChunkClaim::Chunk {
+                index,
+                duplicate: false,
+            };
         }
-        let held = (0..count)
-            .filter(|chunk| missing(chunk) && self.claimed_by(*chunk, peer))
-            .count();
         if held >= DUPLICATING_BELOW {
-            return None;
+            return ChunkClaim::Done;
         }
         (0..count)
             .filter(|chunk| {
@@ -154,6 +183,10 @@ impl InflightPiece {
                     .flatten()
                     .map(|claim| claim.order)
                     .max()
+            })
+            .map_or(ChunkClaim::Done, |index| ChunkClaim::Chunk {
+                index,
+                duplicate: true,
             })
     }
 
@@ -404,7 +437,13 @@ impl PieceTracker {
             }
             let Some(info) = self.inflight.get_mut(&piece) else {
                 if (req.can_reserve)(piece) {
-                    return Some(self.reserve_piece(piece, req.peer));
+                    let reserved = self.reserve_piece(piece, req.peer);
+                    if !self.unshareable.contains(&piece)
+                        && let Some(info) = self.inflight.get_mut(&piece)
+                    {
+                        info.shared = true;
+                    }
+                    return Some(reserved);
                 }
                 continue;
             };
@@ -415,11 +454,15 @@ impl PieceTracker {
             if !participant && info.joiners.len() + 1 >= MAX_SHARED_PARTICIPANTS {
                 continue;
             }
-            if info.next_claim(&self.chunks, piece, req.peer).is_none() {
+            if !matches!(
+                info.next_claim(&self.chunks, piece, req.peer),
+                ChunkClaim::Chunk { .. }
+            ) {
                 continue;
             }
             if !participant {
                 info.joiners.push(req.peer);
+                info.shared = true;
             }
             return Some(AcquireResult::Joined(piece));
         }
@@ -427,22 +470,21 @@ impl PieceTracker {
     }
 
     /// Claims the next chunk of `piece` for `peer` to request, as
-    /// [`InflightPiece::next_claim`] chooses it, and whether another
-    /// participant requested it too. Returns `None` once `peer`
-    /// no longer takes part in the piece or has nothing left to request.
-    pub fn claim_chunk(
-        &mut self,
-        piece: ValidPieceIndex,
-        peer: PeerHandle,
-    ) -> Option<(usize, bool)> {
-        let info = self.inflight.get_mut(&piece)?;
+    /// [`InflightPiece::next_claim`] chooses it. [`ChunkClaim::Done`] once
+    /// `peer` no longer takes part in the piece or has nothing left to
+    /// request.
+    pub fn claim_chunk(&mut self, piece: ValidPieceIndex, peer: PeerHandle) -> ChunkClaim {
+        let Some(info) = self.inflight.get_mut(&piece) else {
+            return ChunkClaim::Done;
+        };
         if !info.is_participant(peer) {
-            return None;
+            return ChunkClaim::Done;
         }
-        let chunk = info.next_claim(&self.chunks, piece, peer)?;
-        let duplicate = info.claims[chunk].iter().any(Option::is_some);
-        info.claim(chunk, peer);
-        Some((chunk, duplicate))
+        let claim = info.next_claim(&self.chunks, piece, peer);
+        if let ChunkClaim::Chunk { index, .. } = claim {
+            info.claim(index, peer);
+        }
+        claim
     }
 
     /// The participants other than `peer` that requested `chunk` of `piece`,
@@ -655,7 +697,12 @@ mod tests {
 
     /// A tracker of `num_pieces` pieces of four chunks each, all selected.
     fn make_four_chunk_tracker(num_pieces: u32) -> (PieceTracker, FileInfos) {
-        let piece_length = 4 * 16384u32;
+        make_tracker(num_pieces, 4)
+    }
+
+    /// A tracker of `num_pieces` pieces of `chunks` chunks each, all selected.
+    fn make_tracker(num_pieces: u32, chunks: u32) -> (PieceTracker, FileInfos) {
+        let piece_length = chunks * 16384u32;
         let total_length = piece_length as u64 * num_pieces as u64;
         let lengths = Lengths::new(total_length, piece_length).unwrap();
         let bf_len = lengths.piece_bitfield_bytes();
@@ -713,7 +760,10 @@ mod tests {
         who: &[PeerHandle],
     ) -> Vec<Option<usize>> {
         who.iter()
-            .map(|peer| tracker.claim_chunk(piece, *peer).map(|(chunk, _)| chunk))
+            .map(|peer| match tracker.claim_chunk(piece, *peer) {
+                ChunkClaim::Chunk { index, .. } => Some(index),
+                ChunkClaim::Full | ChunkClaim::Done => None,
+            })
             .collect()
     }
 
@@ -749,7 +799,7 @@ mod tests {
         );
         assert_eq!(
             tracker.claim_chunk(piece_0, peer(3)),
-            None,
+            ChunkClaim::Done,
             "a peer taking no part claims nothing"
         );
     }
@@ -777,7 +827,7 @@ mod tests {
         );
         assert_eq!(
             tracker.claim_chunk(piece_0, peer(1)),
-            None,
+            ChunkClaim::Done,
             "the owner holds more than two requests"
         );
 
@@ -789,7 +839,10 @@ mod tests {
         );
         assert_eq!(
             tracker.claim_chunk(piece_0, peer(2)),
-            Some((1, true)),
+            ChunkClaim::Chunk {
+                index: 1,
+                duplicate: true
+            },
             "with one request left, the joiner duplicates another"
         );
         assert!(
@@ -818,6 +871,49 @@ mod tests {
         assert_eq!(
             claims(&mut tracker, piece_0, &[peer(2), peer(3)]),
             [None, None]
+        );
+    }
+
+    #[test]
+    fn a_shared_piece_leaves_most_of_its_chunks_to_the_peers_joining_it() {
+        let (mut tracker, file_infos) = make_tracker(2, 64);
+        let piece_0 = first_piece(&tracker);
+        let piece_1 = tracker
+            .chunks()
+            .get_lengths()
+            .validate_piece_index(1)
+            .unwrap();
+        assert!(matches!(
+            acquire_with(&mut tracker, &file_infos, peer(1), &[], &[piece_0]),
+            AcquireResult::Reserved(_)
+        ));
+        let owner = claims(&mut tracker, piece_0, &[peer(1); 16]);
+        assert_eq!(owner, (0..16).map(Some).collect::<Vec<_>>());
+        assert_eq!(
+            tracker.claim_chunk(piece_0, peer(1)),
+            ChunkClaim::Full,
+            "the owner waits with sixteen requests"
+        );
+        acquire_with(&mut tracker, &file_infos, peer(2), &[], &[piece_0]);
+        let joiner = claims(&mut tracker, piece_0, &[peer(2); 16]);
+        assert_eq!(joiner, (48..64).rev().map(Some).collect::<Vec<_>>());
+        assert_eq!(tracker.claim_chunk(piece_0, peer(2)), ChunkClaim::Full);
+
+        chunk_arrives(&mut tracker, piece_0, 0);
+        assert_eq!(
+            tracker.claim_chunk(piece_0, peer(1)),
+            ChunkClaim::Chunk {
+                index: 16,
+                duplicate: false
+            },
+            "an answered request makes room for the next"
+        );
+
+        acquire_with(&mut tracker, &file_infos, peer(3), &[piece_1], &[]);
+        assert_eq!(
+            claims(&mut tracker, piece_1, &[peer(3); 64]),
+            (0..64).map(Some).collect::<Vec<_>>(),
+            "a piece not shared is requested whole"
         );
     }
 

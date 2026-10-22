@@ -93,7 +93,7 @@ use crate::{
     peer_connection::{
         PeerConnection, PeerConnectionHandler, PeerConnectionOptions, WriterRequest,
     },
-    piece_tracker::{AcquireRequest, AcquireResult, PieceTracker},
+    piece_tracker::{AcquireRequest, AcquireResult, ChunkClaim, PieceTracker},
     session::CheckedIncomingConnection,
     session_stats::SessionStats,
     stream_connect::ConnectionKind,
@@ -1857,7 +1857,7 @@ impl PeerHandler {
             // shared piece, coming from its other end, request each chunk once, and
             // duplicate only its last few; a piece stolen with chunks already received
             // fetches only the rest.
-            while let Some(chunk) = self.claim_chunk(next)? {
+            while let Some(chunk) = self.claim_chunk(next).await? {
                 let request = Request {
                     index: next.get(),
                     begin: chunk.offset,
@@ -1926,21 +1926,38 @@ impl PeerHandler {
     }
 
     /// Claims the next chunk of `piece` for this peer to request, from its last chunk
-    /// backwards if the peer joined it. None once the piece is complete or no longer ours.
-    fn claim_chunk(&self, piece: ValidPieceIndex) -> crate::Result<Option<ChunkInfo>> {
-        let claimed = self
-            .state
-            .lock_write("claim_chunk")
-            .get_pieces_mut()?
-            .claim_chunk(piece, self.addr);
-        match claimed {
-            Some((index, duplicate)) => {
-                trace!(%piece, chunk = index, duplicate, "claimed chunk");
-                Ok(self.state.lengths.iter_chunk_infos(piece).nth(index))
-            }
-            None => {
-                trace!(%piece, "nothing left to claim");
-                Ok(None)
+    /// backwards if the peer joined it. While the peer holds as many requests as a
+    /// shared piece allows, waits for one to be answered, so the piece's other chunks
+    /// stay free for its other participants. None once the piece is complete or no
+    /// longer ours.
+    async fn claim_chunk(&self, piece: ValidPieceIndex) -> crate::Result<Option<ChunkInfo>> {
+        loop {
+            // Created before the claim, so that an answer arriving after it still wakes us.
+            let slots = self.request_slots_changed();
+            let answered = slots.as_ref().map(|notify| notify.notified());
+            let claimed = self
+                .state
+                .lock_write("claim_chunk")
+                .get_pieces_mut()?
+                .claim_chunk(piece, self.addr);
+            match claimed {
+                ChunkClaim::Chunk { index, duplicate } => {
+                    trace!(%piece, chunk = index, duplicate, "claimed chunk");
+                    return Ok(self.state.lengths.iter_chunk_infos(piece).nth(index));
+                }
+                ChunkClaim::Full => {
+                    trace!(%piece, "holding a shared piece's share, waiting for a chunk");
+                    let Some(answered) = answered else {
+                        return Ok(None);
+                    };
+                    self.check_stalled()?;
+                    let wait = self.time_until_stalled().unwrap_or(Duration::from_secs(5));
+                    let _ = tokio::time::timeout(wait, answered).await;
+                }
+                ChunkClaim::Done => {
+                    trace!(%piece, "nothing left to claim");
+                    return Ok(None);
+                }
             }
         }
     }
