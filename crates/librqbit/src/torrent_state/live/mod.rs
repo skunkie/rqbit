@@ -1504,10 +1504,12 @@ impl PeerHandler {
         Ok(())
     }
 
-    /// Acquire a piece for this peer: try steal (10x) → reserve → steal (3x).
+    /// Acquire a piece for this peer: try steal (10x) → reserve → join a shared piece →
+    /// steal (3x).
     ///
-    /// Returns the piece index to download, or None if no pieces are available.
-    fn acquire_next_piece(&self) -> crate::Result<Option<ValidPieceIndex>> {
+    /// Returns the piece index to download and whether the peer joined it, requesting its
+    /// chunks from the last one backwards, or None if no pieces are available.
+    fn acquire_next_piece(&self) -> crate::Result<Option<(ValidPieceIndex, bool)>> {
         if self.is_choked() {
             debug!("we are choked, can't acquire piece");
             return Ok(None);
@@ -1531,6 +1533,13 @@ impl PeerHandler {
                 } = &mut **g;
                 let pieces = pieces.as_mut().ok_or(Error::ChunkTrackerEmpty)?;
                 let selector = self.state.shared.options.piece_selector.as_deref();
+                let mut shared_pieces = Vec::new();
+                if let Some(selector) = selector {
+                    selector.shared_pieces(&mut |piece| {
+                        shared_pieces.push(piece);
+                        true
+                    });
+                }
                 let priority_pieces = match selector {
                     Some(selector) => {
                         let mut selected = Vec::new();
@@ -1556,18 +1565,23 @@ impl PeerHandler {
                     },
                     can_reserve: |p| self.state.files.reserve_piece(p),
                     queued_pieces: selector.is_none_or(|s| s.download_other_pieces()),
+                    shared_pieces: &shared_pieces,
                 });
 
                 match result {
                     AcquireResult::Reserved(piece) => {
                         trace!("reserved piece {}", piece);
-                        Ok(Some(piece))
+                        Ok(Some((piece, false)))
+                    }
+                    AcquireResult::Joined(piece) => {
+                        debug!("joined shared piece {}", piece);
+                        Ok(Some((piece, true)))
                     }
                     AcquireResult::Stolen { piece, from_peer } => {
                         debug!("stole piece {} from {}", piece, from_peer);
                         // Store steal info to process after releasing peer lock to avoid deadlock
                         steal_info = Some((from_peer, piece));
-                        Ok(Some(piece))
+                        Ok(Some((piece, false)))
                     }
                     AcquireResult::NoneAvailable => Ok(None),
                 }
@@ -1809,7 +1823,7 @@ impl PeerHandler {
 
             // Acquire a piece using the strategy: try steal (10x) → reserve → steal (3x).
             let new_piece_notify = self.state.new_pieces_notify.notified();
-            let next = match self.acquire_next_piece()? {
+            let (next, joined) = match self.acquire_next_piece()? {
                 Some(next) => next,
                 None => {
                     debug!("no pieces to request");
@@ -1827,7 +1841,10 @@ impl PeerHandler {
                 }
             };
 
-            for chunk in self.state.lengths.iter_chunk_infos(next) {
+            // Chunks are claimed one at a time, so the owner and the peers that joined a
+            // shared piece, coming from its other end, request each chunk once; a piece
+            // stolen with chunks already received fetches only the rest.
+            while let Some(chunk) = self.claim_chunk(next, joined)? {
                 let request = Request {
                     index: next.get(),
                     begin: chunk.offset,
@@ -1893,6 +1910,35 @@ impl PeerHandler {
                 }
             }
         }
+    }
+
+    /// Claims the next chunk of `piece` for this peer to request, from its last chunk
+    /// backwards if the peer joined it. None once the piece is complete or no longer ours.
+    fn claim_chunk(
+        &self,
+        piece: ValidPieceIndex,
+        joined: bool,
+    ) -> crate::Result<Option<ChunkInfo>> {
+        let claimed = self
+            .state
+            .lock_write("claim_chunk")
+            .get_pieces_mut()?
+            .claim_chunk(piece, self.addr, joined);
+        let Some((index, taken_from)) = claimed else {
+            return Ok(None);
+        };
+        let Some(chunk) = self.state.lengths.iter_chunk_infos(piece).nth(index) else {
+            return Ok(None);
+        };
+        // The torrent's lock is released first: peers lock before it.
+        if let Some(owner) = taken_from {
+            self.state
+                .peers
+                .with_live_mut(owner, "cancel_taken_chunk", |live| {
+                    live.cancel_inflight_request(&chunk);
+                });
+        }
+        Ok(Some(chunk))
     }
 
     fn on_i_am_choked(&self) {
@@ -1993,7 +2039,8 @@ impl PeerHandler {
                     .map(|l| l.read());
 
                 match g.get_pieces()?.get_inflight(chunk_info.piece_index) {
-                    Some(inflight) if inflight.peer == addr => {}
+                    // The owner, or a peer that joined the shared piece.
+                    Some(inflight) if inflight.is_participant(addr) => {}
                     Some(inflight) => {
                         debug!(
                             "in-flight piece {} was stolen by {}, ignoring",
@@ -2062,10 +2109,22 @@ impl PeerHandler {
             // It shouldn't impact perf anyway, but dropping just in case.
             drop(ppl_guard);
 
-            let full_piece_download_time = match full_piece_download_time {
-                Some(t) => t,
-                None => return Ok(()),
+            let Some(completed) = full_piece_download_time else {
+                return Ok(());
             };
+            let full_piece_download_time = completed.started.elapsed();
+            // The other participants of a shared piece have requests left for it.
+            let others: Vec<PeerHandle> = completed
+                .participants()
+                .filter(|peer| *peer != addr)
+                .collect();
+            for peer in &others {
+                state
+                    .peers
+                    .with_live_mut(*peer, "cancel_shared_piece", |live| {
+                        live.cancel_inflight_requests_for_piece(chunk_info.piece_index);
+                    });
+            }
 
             match state
                 .file_ops()
@@ -2111,6 +2170,23 @@ impl PeerHandler {
                     state.on_piece_completed(chunk_info.piece_index)?;
 
                     state.transmit_haves(chunk_info.piece_index);
+                }
+                false if !others.is_empty() => {
+                    // Several peers sent its chunks, so the corrupt one is unknown: fetch it
+                    // again from one peer, whose failure then tells.
+                    warn!(
+                        id = state.shared.id,
+                        info_hash = ?state.shared.info_hash,
+                        ?addr,
+                        "checksum for shared piece={} did not validate. fetching it from one peer.",
+                        index
+                    );
+                    state
+                        .lock_write("mark_shared_piece_broken")
+                        .get_pieces_mut()?
+                        .mark_shared_piece_hash_failed(chunk_info.piece_index);
+                    state.files.release_piece(chunk_info.piece_index);
+                    state.new_pieces_notify.notify_waiters();
                 }
                 false => {
                     warn!(

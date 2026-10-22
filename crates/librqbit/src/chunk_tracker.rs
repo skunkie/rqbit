@@ -313,6 +313,14 @@ impl ChunkTracker {
         true
     }
 
+    /// Whether chunk `chunk` of piece `piece` has been received.
+    pub fn is_chunk_downloaded(&self, piece: ValidPieceIndex, chunk: usize) -> bool {
+        self.chunk_status
+            .get(self.lengths.chunk_range(piece))
+            .and_then(|status| status.get(chunk).map(|bit| *bit))
+            .unwrap_or(false)
+    }
+
     pub fn is_chunk_ready_to_upload(&self, chunk: &ChunkInfo) -> bool {
         self.have
             .as_slice()

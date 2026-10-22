@@ -339,6 +339,21 @@ impl LivePeerState {
         }
     }
 
+    /// Cancels one request, as when another peer took its chunk over.
+    pub fn cancel_inflight_request(&mut self, chunk: &ChunkInfo) {
+        if self.inflight_requests.remove(chunk) {
+            let _ = self
+                .tx
+                .send(WriterRequest::Message(Message::Cancel(Request {
+                    index: chunk.piece_index.get(),
+                    begin: chunk.offset,
+                    length: chunk.size,
+                })));
+            self.late_cancelled_request_tolerance += 1;
+            self.request_slots_changed.notify_waiters();
+        }
+    }
+
     pub fn cancel_inflight_requests_for_piece(&mut self, piece: ValidPieceIndex) {
         let tx = &self.tx;
         let late_cancelled_request_tolerance = &mut self.late_cancelled_request_tolerance;

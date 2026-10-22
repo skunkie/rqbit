@@ -18,4 +18,10 @@ pub trait PieceSelector: Send + Sync {
     fn download_other_pieces(&self) -> bool {
         true
     }
+
+    /// Calls `f` with the pieces urgent enough for several peers to fetch at once, until `f`
+    /// returns false. A peer with nothing else to request joins such a piece while it is in
+    /// flight and requests its chunks from the last one backwards, while its owner goes
+    /// forwards. Called like [`priority_pieces`](Self::priority_pieces). None by default.
+    fn shared_pieces(&self, _f: &mut dyn FnMut(ValidPieceIndex) -> bool) {}
 }
