@@ -1535,8 +1535,8 @@ impl PeerHandler {
                 let selector = self.state.shared.options.piece_selector.as_deref();
                 let mut shared_pieces = Vec::new();
                 if let Some(selector) = selector {
-                    selector.shared_pieces(&mut |piece| {
-                        shared_pieces.push(piece);
+                    selector.shared_pieces(&mut |piece, tier| {
+                        shared_pieces.push((piece, tier));
                         true
                     });
                 }

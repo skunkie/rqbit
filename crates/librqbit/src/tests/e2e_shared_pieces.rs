@@ -39,8 +39,8 @@ impl PieceSelector for UrgentFirstPiece {
         false
     }
 
-    fn shared_pieces(&self, f: &mut dyn FnMut(ValidPieceIndex) -> bool) {
-        f(self.0);
+    fn shared_pieces(&self, f: &mut dyn FnMut(ValidPieceIndex, u8) -> bool) {
+        f(self.0, 0);
     }
 }
 

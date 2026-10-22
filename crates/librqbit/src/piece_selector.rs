@@ -19,9 +19,12 @@ pub trait PieceSelector: Send + Sync {
         true
     }
 
-    /// Calls `f` with the pieces urgent enough for several peers to fetch at once, until `f`
-    /// returns false. A peer with nothing else to request joins such a piece while it is in
-    /// flight and requests its chunks from the last one backwards, while its owner goes
-    /// forwards. Called like [`priority_pieces`](Self::priority_pieces). None by default.
-    fn shared_pieces(&self, _f: &mut dyn FnMut(ValidPieceIndex) -> bool) {}
+    /// Calls `f` with the pieces urgent enough for several peers to fetch at once, each with
+    /// its tier, 0 the most urgent, until `f` returns false. A peer with nothing else to
+    /// request joins such a piece while it is in flight and requests its chunks from the last
+    /// one backwards, while its owner goes forwards. Free peers give every piece of a tier an
+    /// owner, then help those with chunks no one requested, before turning to the next tier;
+    /// duplicating requests comes last. Called like
+    /// [`priority_pieces`](Self::priority_pieces). None by default.
+    fn shared_pieces(&self, _f: &mut dyn FnMut(ValidPieceIndex, u8) -> bool) {}
 }
