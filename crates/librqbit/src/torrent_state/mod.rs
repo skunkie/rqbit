@@ -280,6 +280,14 @@ impl ManagedTorrent {
         }
     }
 
+    /// The torrent's verified pieces, as a bitfield in the order of the `bitfield` message
+    /// (BEP 3), once its first check has finished: what an embedder that tracks its storage's
+    /// pieces, as with [`AddTorrentOptions::initial_pieces`](crate::AddTorrentOptions::initial_pieces),
+    /// records after a full check.
+    pub fn have_pieces(&self) -> anyhow::Result<Vec<u8>> {
+        self.with_chunk_tracker(|chunks| chunks.get_have_pieces().as_bytes().to_vec())
+    }
+
     /// Get the live state if the torrent is live.
     pub fn live(&self) -> Option<Arc<TorrentStateLive>> {
         let g = self.locked.read();

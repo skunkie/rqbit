@@ -78,6 +78,16 @@ async fn checked_bytes(
         .context("the torrent")?;
     handle.wait_until_initialized().await?;
     let progress = handle.stats().progress_bytes;
+    let have: u32 = handle
+        .have_pieces()?
+        .iter()
+        .map(|byte| byte.count_ones())
+        .sum();
+    assert_eq!(
+        u64::from(have) * PIECE,
+        progress,
+        "the verified pieces account for the progress"
+    );
     session.stop().await;
     Ok(progress)
 }
