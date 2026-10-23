@@ -123,6 +123,9 @@ pub(crate) struct ManagedTorrentOptions {
     pub peer_limit: Option<usize>,
     pub disable_upload: bool,
     pub piece_selector: Option<Arc<dyn PieceSelector>>,
+    /// The embedder's bitfield for the first check; see
+    /// [`AddTorrentOptions::initial_pieces`](crate::AddTorrentOptions::initial_pieces).
+    pub initial_pieces: Option<Box<[u8]>>,
 }
 
 impl ManagedTorrentOptions {

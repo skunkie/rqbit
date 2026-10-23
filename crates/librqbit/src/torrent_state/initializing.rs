@@ -23,6 +23,14 @@ use crate::{
 
 const MAX_FASTRESUME_CHECKS: usize = 64;
 
+/// Why a claimed bitfield was not used.
+enum Invalid {
+    /// It has the wrong length, so it does not describe this torrent.
+    Length,
+    /// A sampled piece failed its hash check.
+    Corrupt,
+}
+
 use super::{ManagedTorrentShared, TorrentMetadata, paused::TorrentStatePaused};
 
 pub struct TorrentStateInitializing {
@@ -89,6 +97,38 @@ impl TorrentStateInitializing {
         have_pieces: Option<Box<dyn BitV>>,
     ) -> Option<Box<dyn BitV>> {
         let hp = have_pieces?;
+        match self.validate_have_pieces(hp).await {
+            Ok(hp) => Some(hp),
+            Err(Invalid::Length) => None,
+            Err(Invalid::Corrupt) => {
+                if let Err(e) = bitv_factory.clear(self.shared.id.into()).await {
+                    warn!(id=?self.shared.id, info_hash = ?self.shared.info_hash, "error clearing bitfield: {e:#}");
+                }
+                None
+            }
+        }
+    }
+
+    /// Validates the embedder's initial bitfield, which must also leave the bits past
+    /// the last piece clear.
+    async fn validate_initial_pieces(&self, bytes: &[u8]) -> Option<BF> {
+        let pieces = self.metadata.lengths().total_pieces() as usize;
+        let hp = BF::from_boxed_slice(bytes.into());
+        if hp.len() >= pieces && hp[pieces..].any() {
+            warn!(
+                id = ?self.shared.id,
+                "the initial bitfield has bits past the last piece, ignoring it, will do full check"
+            );
+            return None;
+        }
+        self.validate_have_pieces(hp.clone().into_dyn())
+            .await
+            .ok()
+            .map(|_| hp)
+    }
+
+    /// Checks a claimed bitfield's length, and hashes a sample of the pieces it claims.
+    async fn validate_have_pieces(&self, hp: Box<dyn BitV>) -> Result<Box<dyn BitV>, Invalid> {
         let actual = hp.as_bytes().len();
         let expected = self.metadata.lengths().piece_bitfield_bytes();
         if actual != expected {
@@ -97,7 +137,7 @@ impl TorrentStateInitializing {
                 expected,
                 "the bitfield loaded isn't of correct length, ignoring it, will do full check"
             );
-            return None;
+            return Err(Invalid::Length);
         }
 
         let is_broken = self
@@ -176,14 +216,11 @@ impl TorrentStateInitializing {
                 info_hash = ?self.shared.info_hash,
                 "data corrupted, ignoring fastresume data"
             );
-            if let Err(e) = bitv_factory.clear(self.shared.id.into()).await {
-                warn!(id=?self.shared.id, info_hash = ?self.shared.info_hash, "error clearing bitfield: {e:#}");
-            }
             self.checked_bytes.store(0, Ordering::Relaxed);
-            return None;
+            return Err(Invalid::Corrupt);
         }
 
-        Some(hp)
+        Ok(hp)
     }
 
     pub async fn check(&self) -> anyhow::Result<TorrentStatePaused> {
@@ -195,19 +232,29 @@ impl TorrentStateInitializing {
             .context("session is dead")?
             .bitv_factory
             .clone();
-        let have_pieces = if self.previously_errored {
+        let initial_pieces = match &self.shared.options.initial_pieces {
+            Some(bytes) if !self.previously_errored => self.validate_initial_pieces(bytes).await,
+            _ => None,
+        };
+        let have_pieces = if let Some(initial_pieces) = initial_pieces {
+            Some(
+                bitv_factory
+                    .store_initial_check(id, initial_pieces)
+                    .await
+                    .context("error storing the initial bitfield")?,
+            )
+        } else if self.previously_errored {
             if let Err(e) = bitv_factory.clear(id).await {
                 warn!(id=?self.shared.id, info_hash = ?self.shared.info_hash, error=?e, "error clearing bitfield");
             }
             None
         } else {
-            bitv_factory
+            let loaded = bitv_factory
                 .load(id)
                 .await
-                .context("error loading have_pieces")?
+                .context("error loading have_pieces")?;
+            self.validate_fastresume(&*bitv_factory, loaded).await
         };
-
-        let have_pieces = self.validate_fastresume(&*bitv_factory, have_pieces).await;
 
         let have_pieces = match have_pieces {
             Some(h) => h,

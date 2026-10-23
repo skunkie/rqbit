@@ -314,6 +314,15 @@ pub struct AddTorrentOptions {
     /// feature's session option disables upload for every torrent.
     #[serde(default)]
     pub disable_upload: bool,
+
+    /// The pieces the embedder knows the storage holds, as a bitfield in the order of
+    /// the `bitfield` message (BEP 3), one bit per piece. The first check validates a
+    /// sample of them, as it validates fastresume data, instead of hashing every piece,
+    /// and falls back to the full check if any sampled piece fails or the bitfield has
+    /// the wrong length. It takes the place of the session's fastresume data, and a
+    /// torrent checked again after an error ignores it.
+    #[serde(skip)]
+    pub initial_pieces: Option<Vec<u8>>,
 }
 
 pub struct ListOnlyResponse {
@@ -1406,6 +1415,7 @@ impl Session {
                     peer_limit: opts.peer_limit.or(self.peer_limit),
                     disable_upload: opts.disable_upload || self.disable_upload_by_default(),
                     piece_selector: opts.piece_selector.clone(),
+                    initial_pieces: opts.initial_pieces.clone().map(Vec::into_boxed_slice),
                 },
                 connector: self.connector.clone(),
                 session: Arc::downgrade(self),
