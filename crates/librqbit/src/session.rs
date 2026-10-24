@@ -1038,7 +1038,13 @@ impl Session {
                         }
                     }
                 },
-                Some(Ok((live, checked))) = futs.next(), if !futs.is_empty() => {
+                // A failed check must match too: a pattern that does not match
+                // disables the branch until the next accept, stalling every
+                // check that completes meanwhile. The failure is logged above.
+                Some(checked) = futs.next(), if !futs.is_empty() => {
+                    let Ok((live, checked)) = checked else {
+                        continue;
+                    };
                     let (addr, kind) = (checked.addr, checked.kind);
                     if let Err(e) = live.add_incoming_peer(checked) {
                         warn!(?addr, ?kind, "error handing over incoming connection: {e:#}");
