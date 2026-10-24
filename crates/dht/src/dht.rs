@@ -384,6 +384,11 @@ impl RecursiveRequest<RecursiveRequestCallbacksGetPeers> {
                         r = &mut looper => {
                             return r
                         }
+                        // A stopped DHT sends nothing, so end the stream
+                        // rather than keep querying a closed worker.
+                        _ = this.dht.cancellation_token.cancelled() => {
+                            return Ok(())
+                        }
                     }
                 }
             },
@@ -1468,6 +1473,22 @@ mod tests {
         .expect("the DHT stopped answering");
         let response = bprotocol::deserialize_message::<ByteBufOwned>(&buf[..len]).unwrap();
         assert!(matches!(response.kind, MessageKind::Response(_)));
+    }
+
+    #[tokio::test]
+    async fn test_get_peers_stream_ends_when_dht_stops() {
+        use futures::StreamExt;
+
+        // Stays open, so the bootstrap query gets neither an answer nor an ICMP error.
+        let silent = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let dht = start_dht(silent.local_addr().unwrap()).await;
+        let mut peers = dht.get_peers(crate::Id20::new([7; 20]), None);
+
+        dht.cancellation_token().cancel();
+        let next = tokio::time::timeout(Duration::from_secs(5), peers.next())
+            .await
+            .expect("the stream ends once the DHT stops");
+        assert_eq!(next, None);
     }
 
     // On Windows, an ICMP port unreachable that comes back for an earlier send_to makes the next

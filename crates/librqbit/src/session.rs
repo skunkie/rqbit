@@ -118,7 +118,11 @@ pub struct Session {
     peer_id: Id20,
     announce_port: Option<u16>,
     listen_addr: Option<SocketAddr>,
-    dht: Option<Dht>,
+    // Replaced by set_dht. Torrents take the DHT when they start.
+    dht: RwLock<Option<Dht>>,
+    // Serializes set_dht, which awaits while starting a DHT.
+    dht_change: tokio::sync::Mutex<()>,
+    bind_device: Option<BindDevice>,
     pub(crate) connector: Arc<StreamConnector>,
     reqwest_client: reqwest::Client,
     udp_tracker_client: UdpTrackerClient,
@@ -235,6 +239,38 @@ fn compute_only_files(
             Ok(Some(only_files))
         }
         (None, None) => Ok(None),
+    }
+}
+
+/// Starts a DHT that runs until `token` is cancelled.
+async fn start_dht(
+    config: DhtSessionConfig,
+    ipv4_only: bool,
+    bind_device: Option<&BindDevice>,
+    token: CancellationToken,
+) -> anyhow::Result<Dht> {
+    if let Some(persistence_config) = config.persistence {
+        PersistentDht::create(
+            persistence_config,
+            config.port,
+            ipv4_only,
+            config.bootstrap_addrs,
+            Some(token),
+            bind_device,
+        )
+        .await
+        .context("error initializing persistent DHT")
+    } else {
+        let listen_addr = dht_listen_addr(config.port, None, ipv4_only);
+        DhtBuilder::with_config(DhtConfig {
+            bootstrap_addrs: config.bootstrap_addrs,
+            cancellation_token: Some(token),
+            bind_device,
+            listen_addr: Some(listen_addr),
+            ..Default::default()
+        })
+        .await
+        .context("error initializing DHT")
     }
 }
 
@@ -638,34 +674,17 @@ impl Session {
                 None
             };
 
-            let dht = if let Some(dht_config) = opts.dht.take() {
-                let dht = if let Some(persistence_config) = dht_config.persistence {
-                    PersistentDht::create(
-                        persistence_config,
-                        dht_config.port,
+            let dht = match opts.dht.take() {
+                Some(dht_config) => Some(
+                    start_dht(
+                        dht_config,
                         opts.ipv4_only,
-                        dht_config.bootstrap_addrs,
-                        Some(token.clone()),
                         bind_device.as_ref(),
+                        token.child_token(),
                     )
-                    .await
-                    .context("error initializing persistent DHT")?
-                } else {
-                    let listen_addr = dht_listen_addr(dht_config.port, None, opts.ipv4_only);
-                    DhtBuilder::with_config(DhtConfig {
-                        bootstrap_addrs: dht_config.bootstrap_addrs,
-                        cancellation_token: Some(token.child_token()),
-                        bind_device: bind_device.as_ref(),
-                        listen_addr: Some(listen_addr),
-                        ..Default::default()
-                    })
-                    .await
-                    .context("error initializing DHT")?
-                };
-
-                Some(dht)
-            } else {
-                None
+                    .await?,
+                ),
+                None => None,
             };
             let peer_opts = opts
                 .connect
@@ -816,7 +835,9 @@ impl Session {
                 persistence,
                 bitv_factory,
                 peer_id,
-                dht,
+                dht: RwLock::new(dht),
+                dht_change: tokio::sync::Mutex::new(()),
+                bind_device: bind_device.clone(),
                 peer_opts,
                 spawner: spawner.clone(),
                 output_folder: default_output_folder,
@@ -1063,8 +1084,35 @@ impl Session {
         pf.run_forever().await
     }
 
-    pub fn get_dht(&self) -> Option<&Dht> {
-        self.dht.as_ref()
+    pub fn get_dht(&self) -> Option<Dht> {
+        self.dht.read().clone()
+    }
+
+    /// Starts the DHT with `config`, replacing a running one, or stops it
+    /// with `None`. Stopping ends the DHT's peer searches at once, including
+    /// those of running torrents, which keep their other peer sources. A
+    /// started DHT serves torrents as they start: when they are added or
+    /// unpaused.
+    pub async fn set_dht(&self, config: Option<DhtSessionConfig>) -> anyhow::Result<()> {
+        let _change = self.dht_change.lock().await;
+        if let Some(previous) = self.dht.write().take() {
+            previous.cancellation_token().cancel();
+        }
+        let Some(config) = config else {
+            return Ok(());
+        };
+        let dht = tracked(
+            self.tasks.clone(),
+            start_dht(
+                config,
+                self.ipv4_only,
+                self.bind_device.as_ref(),
+                self.cancellation_token.child_token(),
+            ),
+        )
+        .await?;
+        *self.dht.write() = Some(dht);
+        Ok(())
     }
 
     fn merge_peer_opts(&self, other: Option<PeerConnectionOptions>) -> PeerConnectionOptions {
@@ -1603,7 +1651,7 @@ impl Session {
         let dht_rx = if is_private {
             None
         } else {
-            self.dht.as_ref().map(|dht| {
+            self.dht.read().as_ref().map(|dht| {
                 dht.get_peers(info_hash, if announce { self.announce_port } else { None })
             })
         };
