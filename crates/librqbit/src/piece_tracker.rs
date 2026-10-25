@@ -107,10 +107,6 @@ impl InflightPiece {
         }
     }
 
-    fn release_all_claims(&mut self) {
-        self.claims.fill([None; CLAIMS_PER_CHUNK]);
-    }
-
     /// Removes `peer` from the participants, handing ownership to the first
     /// joiner if `peer` owned the piece. Returns false if `peer` owned it
     /// alone, which leaves the piece unchanged.
@@ -412,10 +408,11 @@ impl PieceTracker {
 
         // Update ownership (piece stays in inflight, just changes owner).
         // The old owner's requests are cancelled; chunks already received
-        // stay, so the new owner fetches only the rest. A piece this slow may
-        // wait on a joiner too, so every request is free to make again.
+        // stay, so the new owner fetches only the rest. The joiners' requests
+        // stay in flight, so their claims stay too; a slow joiner's last
+        // chunks are duplicated like any shared piece's.
         let info = self.inflight.get_mut(&piece)?;
-        info.release_all_claims();
+        info.release_claims_of(old_peer);
         info.joiners.retain(|joiner| *joiner != req.peer);
         info.peer = req.peer;
         info.started = Instant::now();
@@ -1171,7 +1168,7 @@ mod tests {
     }
 
     #[test]
-    fn a_steal_frees_every_participants_requests() {
+    fn a_steal_frees_only_the_old_owners_requests() {
         let (mut tracker, file_infos) = make_four_chunk_tracker(1);
         let piece_0 = first_piece(&tracker);
         acquire_with(&mut tracker, &file_infos, peer(1), &[piece_0], &[]);
@@ -1197,8 +1194,13 @@ mod tests {
         ));
         assert_eq!(
             claims(&mut tracker, piece_0, &[peer(3); 4]),
-            [Some(0), Some(1), Some(2), Some(3)],
-            "a joiner's requests do not hold back the new owner"
+            [Some(0), Some(1), None, None],
+            "the new owner makes the old owner's requests"
+        );
+        assert_eq!(
+            claims(&mut tracker, piece_0, &[peer(2)]),
+            [None],
+            "a joiner's requests are still in flight, so it makes none again"
         );
     }
 
