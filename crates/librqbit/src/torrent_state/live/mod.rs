@@ -2181,11 +2181,25 @@ impl PeerHandler {
                     });
             }
 
-            match state
+            let checked = state
                 .file_ops()
                 .check_piece(chunk_info.piece_index)
-                .with_context(|| format!("error checking piece={index}"))?
-            {
+                .with_context(|| format!("error checking piece={index}"));
+            let checked = match checked {
+                Ok(checked) => checked,
+                Err(e) => {
+                    // A check that could not run decides nothing; the piece
+                    // goes back to the queue rather than staying unrequested.
+                    state
+                        .lock_write("mark_piece_unchecked")
+                        .get_pieces_mut()?
+                        .mark_piece_hash_failed(chunk_info.piece_index);
+                    state.files.release_piece(chunk_info.piece_index);
+                    state.new_pieces_notify.notify_waiters();
+                    return Err(e);
+                }
+            };
+            match checked {
                 true => {
                     {
                         let mut g = state.lock_write("mark_piece_downloaded");
