@@ -16,7 +16,12 @@ gen_stats!(SessionCountersAtomic SessionCountersSnapshot, [
     fetched_bytes u64,
     uploaded_bytes u64,
     blocked_incoming u64,
-    blocked_outgoing u64
+    blocked_outgoing u64,
+    // Downloaded pieces whose hash check passed, and those whose check
+    // failed, counted once per check; a check that could not run counts in
+    // neither.
+    hash_checks_passed u64,
+    hash_checks_failed u64
 ], []);
 
 pub struct SessionStats {

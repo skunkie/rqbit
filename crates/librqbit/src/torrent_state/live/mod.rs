@@ -2199,6 +2199,11 @@ impl PeerHandler {
                     return Err(e);
                 }
             };
+            let outcome = match checked {
+                true => &state.session_stats.counters.hash_checks_passed,
+                false => &state.session_stats.counters.hash_checks_failed,
+            };
+            outcome.fetch_add(1, Ordering::Relaxed);
             match checked {
                 true => {
                     {
