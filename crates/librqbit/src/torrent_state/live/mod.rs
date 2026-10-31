@@ -1596,6 +1596,14 @@ impl PeerHandler {
         // Process steal notification outside the peer lock to avoid deadlock
         if let Some((from_peer, piece)) = steal_info {
             self.state.peers.on_steal(from_peer, self.addr, piece);
+            // With the old owner's requests cancelled, their chunks are free.
+            if let Ok(pieces) = self
+                .state
+                .lock_write("release_cancelled_claims")
+                .get_pieces_mut()
+            {
+                pieces.release_cancelled_claims(piece, from_peer);
+            }
         }
 
         result

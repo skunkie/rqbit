@@ -74,6 +74,10 @@ pub struct InflightPiece {
 struct Claim {
     peer: PeerHandle,
     order: u32,
+    /// Whether a steal is cancelling the request. The claim holds the
+    /// chunk until the cancellation is sent, so the peer cannot claim it
+    /// again while the request is still in its in-flight set.
+    cancelling: bool,
 }
 
 impl InflightPiece {
@@ -102,6 +106,24 @@ impl InflightPiece {
     fn release_claims_of(&mut self, peer: PeerHandle) {
         for claim in self.claims.iter_mut().flatten() {
             if claim.is_some_and(|claim| claim.peer == peer) {
+                *claim = None;
+            }
+        }
+    }
+
+    /// Marks the requests `peer` made as being cancelled by a steal.
+    fn cancel_claims_of(&mut self, peer: PeerHandle) {
+        for claim in self.claims.iter_mut().flatten().flatten() {
+            if claim.peer == peer {
+                claim.cancelling = true;
+            }
+        }
+    }
+
+    /// Frees the chunks of `peer`'s requests that a steal cancelled.
+    fn release_cancelled_claims_of(&mut self, peer: PeerHandle) {
+        for claim in self.claims.iter_mut().flatten() {
+            if claim.is_some_and(|claim| claim.peer == peer && claim.cancelling) {
                 *claim = None;
             }
         }
@@ -190,7 +212,11 @@ impl InflightPiece {
     fn claim(&mut self, chunk: usize, peer: PeerHandle) {
         let order = self.next_order;
         if let Some(slot) = self.claims[chunk].iter_mut().find(|slot| slot.is_none()) {
-            *slot = Some(Claim { peer, order });
+            *slot = Some(Claim {
+                peer,
+                order,
+                cancelling: false,
+            });
             self.next_order += 1;
         }
     }
@@ -307,7 +333,8 @@ impl PieceTracker {
     /// 4. Try to steal a piece from a peer that's 3x slower
     ///
     /// If `Stolen` is returned, the caller MUST call `peers.on_steal()` to notify
-    /// the old peer and update counters.
+    /// the old peer, update counters, and cancel the old peer's requests, and
+    /// then [`Self::release_cancelled_claims`] to free their chunks.
     pub fn acquire_piece<I, P, S, R>(
         &mut self,
         mut req: AcquireRequest<I, P, S, R>,
@@ -408,11 +435,15 @@ impl PieceTracker {
 
         // Update ownership (piece stays in inflight, just changes owner).
         // The old owner's requests are cancelled; chunks already received
-        // stay, so the new owner fetches only the rest. The joiners' requests
-        // stay in flight, so their claims stay too; a slow joiner's last
-        // chunks are duplicated like any shared piece's.
+        // stay, so the new owner fetches only the rest. Their claims stay
+        // until the caller has cancelled them outside this lock: freed now,
+        // the old owner could join again and claim a chunk still in its
+        // in-flight set, which the cancellation would then remove, leaving
+        // the claim with no request. The joiners' requests stay in flight,
+        // so their claims stay too; a slow joiner's last chunks are
+        // duplicated like any shared piece's.
         let info = self.inflight.get_mut(&piece)?;
-        info.release_claims_of(old_peer);
+        info.cancel_claims_of(old_peer);
         info.joiners.retain(|joiner| *joiner != req.peer);
         info.peer = req.peer;
         info.started = Instant::now();
@@ -528,6 +559,14 @@ impl PieceTracker {
             info.claim(index, peer);
         }
         claim
+    }
+
+    /// Frees the chunks of the requests a steal of `piece` from `peer`
+    /// cancelled, once they are cancelled.
+    pub fn release_cancelled_claims(&mut self, piece: ValidPieceIndex, peer: PeerHandle) {
+        if let Some(info) = self.inflight.get_mut(&piece) {
+            info.release_cancelled_claims_of(peer);
+        }
     }
 
     /// The participants other than `peer` that requested `chunk` of `piece`,
@@ -1192,6 +1231,7 @@ mod tests {
             stolen,
             AcquireResult::Stolen { piece, from_peer } if piece == piece_0 && from_peer == peer(1)
         ));
+        tracker.release_cancelled_claims(piece_0, peer(1));
         assert_eq!(
             claims(&mut tracker, piece_0, &[peer(3); 4]),
             [Some(0), Some(1), None, None],
@@ -1201,6 +1241,44 @@ mod tests {
             claims(&mut tracker, piece_0, &[peer(2)]),
             [None],
             "a joiner's requests are still in flight, so it makes none again"
+        );
+    }
+
+    #[test]
+    fn a_stolen_piece_keeps_the_old_owners_requests_until_they_are_cancelled() {
+        let (mut tracker, file_infos) = make_four_chunk_tracker(1);
+        let piece_0 = first_piece(&tracker);
+        acquire_with(&mut tracker, &file_infos, peer(1), &[piece_0], &[]);
+        claims(&mut tracker, piece_0, &[peer(1); 4]);
+
+        let file_priorities = make_default_file_priorities(&file_infos);
+        let stolen = tracker.acquire_piece(AcquireRequest {
+            peer: peer(2),
+            peer_avg_time: Some(Duration::ZERO),
+            priority_pieces: std::iter::empty(),
+            file_priorities: &file_priorities,
+            file_infos: &file_infos,
+            peer_has_piece: |_| true,
+            can_steal: |_| true,
+            can_reserve: |_| true,
+            queued_pieces: false,
+            shared_pieces: &[],
+        });
+        assert!(matches!(stolen, AcquireResult::Stolen { .. }));
+
+        // Before the old owner's requests are cancelled, it joins again.
+        acquire_with(&mut tracker, &file_infos, peer(1), &[], &[piece_0]);
+        assert_eq!(
+            claims(&mut tracker, piece_0, &[peer(1)]),
+            [None],
+            "chunks still in the old owner's in-flight set are not claimed again"
+        );
+
+        tracker.release_cancelled_claims(piece_0, peer(1));
+        assert_eq!(
+            claims(&mut tracker, piece_0, &[peer(2); 4]),
+            [Some(0), Some(1), Some(2), Some(3)],
+            "once cancelled, the new owner requests them"
         );
     }
 
