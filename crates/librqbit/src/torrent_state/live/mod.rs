@@ -1493,12 +1493,10 @@ impl PeerHandler {
                             }
                         })
                         .unwrap_or(false);
-                    if should_requeue {
-                        self.state
-                            .peer_queue_tx
-                            .send(handle)
-                            .ok()
-                            .ok_or(Error::TorrentIsNotLive)?;
+                    // A torrent that paused or stopped while we waited has
+                    // closed its peer queue; that ends the wait, no error.
+                    if should_requeue && self.state.peer_queue_tx.send(handle).is_err() {
+                        debug!("the torrent stopped before the peer was queued again");
                     }
                     Ok::<_, Error>(())
                 },
