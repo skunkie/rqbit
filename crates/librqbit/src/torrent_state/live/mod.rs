@@ -321,10 +321,16 @@ impl TorrentStateLive {
                         let now = Instant::now();
                         let stats = state.stats_snapshot();
                         let fetched = stats.fetched_bytes;
-                        let remaining = state
+                        // A pause takes the chunk tracker after cancelling
+                        // this task, which may already be waiting for the
+                        // lock; the torrent is then paused, not failed.
+                        let Ok(remaining) = state
                             .lock_read("get_remaining_bytes")
-                            .get_chunks()?
-                            .get_remaining_bytes();
+                            .get_chunks()
+                            .map(|chunks| chunks.get_remaining_bytes())
+                        else {
+                            return Ok(());
+                        };
                         state
                             .down_speed_estimator
                             .add_snapshot(fetched, Some(remaining), now);
