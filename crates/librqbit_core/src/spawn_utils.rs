@@ -83,7 +83,15 @@ async fn with_cancel<E: Display + Send + 'static>(
             debug!("task cancelled");
             Ok(())
         },
-        r = fut => r
+        r = fut => match r {
+            // A task running when its token was cancelled can fail on what
+            // the cancellation took away, which is not worth reporting.
+            Err(e) if cancellation_token.is_cancelled() => {
+                debug!("task cancelled, ending with: {e:#}");
+                Ok(())
+            }
+            r => r,
+        }
     }
 }
 
@@ -159,6 +167,18 @@ mod tests {
         assert!(tasks.is_empty());
         token.cancel();
         untracked.await.ok();
+    }
+
+    #[tokio::test]
+    async fn a_failure_is_reported_only_while_not_cancelled() {
+        let token = CancellationToken::new();
+        let failing = || async { Err::<(), &str>("failed") };
+        assert_eq!(with_cancel(token.clone(), failing()).await, Err("failed"));
+        token.cancel();
+        // Either branch of the select can run first.
+        for _ in 0..64 {
+            assert_eq!(with_cancel(token.clone(), failing()).await, Ok(()));
+        }
     }
 
     fn debug_span() -> tracing::Span {
