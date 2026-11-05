@@ -561,6 +561,19 @@ impl PieceTracker {
         claim
     }
 
+    /// Whether `peer` still holds its claim of `chunk` of `piece`. A peer that
+    /// waited to send the request may have lost the claim to a steal, a
+    /// choke, or another peer's copy of the chunk.
+    pub fn holds_claim(&self, piece: ValidPieceIndex, chunk: usize, peer: PeerHandle) -> bool {
+        self.inflight
+            .get(&piece)
+            .and_then(|info| info.claims.get(chunk))
+            .into_iter()
+            .flatten()
+            .flatten()
+            .any(|claim| claim.peer == peer && !claim.cancelling)
+    }
+
     /// Frees the chunks of the requests a steal of `piece` from `peer`
     /// cancelled, once they are cancelled.
     pub fn release_cancelled_claims(&mut self, piece: ValidPieceIndex, peer: PeerHandle) {
@@ -1279,6 +1292,34 @@ mod tests {
             claims(&mut tracker, piece_0, &[peer(2); 4]),
             [Some(0), Some(1), Some(2), Some(3)],
             "once cancelled, the new owner requests them"
+        );
+    }
+
+    #[test]
+    fn a_stolen_piece_takes_the_old_owners_claims_away_at_once() {
+        let (mut tracker, file_infos) = make_four_chunk_tracker(1);
+        let piece_0 = first_piece(&tracker);
+        acquire_with(&mut tracker, &file_infos, peer(1), &[piece_0], &[]);
+        claims(&mut tracker, piece_0, &[peer(1)]);
+        assert!(tracker.holds_claim(piece_0, 0, peer(1)));
+        assert!(!tracker.holds_claim(piece_0, 1, peer(1)));
+
+        let file_priorities = make_default_file_priorities(&file_infos);
+        tracker.acquire_piece(AcquireRequest {
+            peer: peer(2),
+            peer_avg_time: Some(Duration::ZERO),
+            priority_pieces: std::iter::empty(),
+            file_priorities: &file_priorities,
+            file_infos: &file_infos,
+            peer_has_piece: |_| true,
+            can_steal: |_| true,
+            can_reserve: |_| true,
+            queued_pieces: false,
+            shared_pieces: &[],
+        });
+        assert!(
+            !tracker.holds_claim(piece_0, 0, peer(1)),
+            "a request still waiting to be sent must not go out"
         );
     }
 

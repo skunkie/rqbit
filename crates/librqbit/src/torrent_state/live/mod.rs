@@ -1896,17 +1896,36 @@ impl PeerHandler {
                     .state
                     .peers
                     .with_live_mut(handle, "add chunk request", |live| {
+                        // The waits above can outlast the claim. Sending the
+                        // request anyway would leave it in flight with no
+                        // claim, and claiming the chunk again would find it.
+                        // Checked under the peer's lock, so a steal after
+                        // this cancels the request.
+                        let claimed = self
+                            .state
+                            .lock_read("check chunk claim")
+                            .get_pieces()
+                            .is_ok_and(|pieces| {
+                                pieces.holds_claim(next, chunk.chunk_index as usize, handle)
+                            });
+                        if !claimed {
+                            return None;
+                        }
                         let idle = live.requested_inflight_count() == 0;
-                        (live.add_inflight_request(chunk), idle)
+                        Some((live.add_inflight_request(chunk), idle))
                     }) {
-                    Some((true, idle)) => {
+                    Some(None) => {
+                        trace!(?chunk, "the claim was lost before the request was sent");
+                        continue;
+                    }
+                    Some(Some((true, idle))) => {
                         // A peer is measured from its first request, not
                         // from its last delivery before it went idle.
                         if idle {
                             self.lock_flow_control("first request").last_delivery = Instant::now();
                         }
                     }
-                    Some((false, _)) => {
+                    Some(Some((false, _))) => {
                         // This request was already in-flight for this peer for this chunk.
                         // This might happen in theory, but not very likely.
                         //
