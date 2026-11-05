@@ -321,6 +321,16 @@ impl ChunkTracker {
             .unwrap_or(false)
     }
 
+    /// The bytes of `piece` received so far, whether or not it has passed its
+    /// hash check, for showing progress within a large piece.
+    pub fn received_bytes(&self, piece: ValidPieceIndex) -> u64 {
+        self.lengths
+            .iter_chunk_infos(piece)
+            .filter(|chunk| self.is_chunk_downloaded(piece, chunk.chunk_index as usize))
+            .map(|chunk| u64::from(chunk.size))
+            .sum()
+    }
+
     pub fn is_chunk_ready_to_upload(&self, chunk: &ChunkInfo) -> bool {
         self.have
             .as_slice()
@@ -446,6 +456,7 @@ impl ChunkTracker {
 #[cfg(test)]
 mod tests {
     use librqbit_core::{constants::CHUNK_SIZE, lengths::Lengths};
+    use peer_binary_protocol::Piece;
     use std::collections::HashSet;
 
     use crate::{
@@ -747,6 +758,33 @@ mod tests {
             !ct.queue_pieces[0],
             "a piece we have is still queued, so a second peer will download it again"
         );
+    }
+
+    #[test]
+    fn test_received_bytes_counts_chunks_until_a_hash_check_fails() {
+        let piece_len = CHUNK_SIZE * 2;
+        let l = Lengths::new(piece_len as u64 * 2, piece_len).unwrap();
+        let files = vec![FileInfo {
+            relative_filename: "file".into(),
+            offset_in_torrent: 0,
+            piece_range: 0..2,
+            attrs: Default::default(),
+            len: piece_len as u64 * 2,
+        }];
+        let bf_len = l.piece_bitfield_bytes();
+        let have = BF::from_boxed_slice(vec![0u8; bf_len].into_boxed_slice());
+        let mut selected = BF::from_boxed_slice(vec![0u8; bf_len].into_boxed_slice());
+        selected.get_mut(0..2).unwrap().fill(true);
+        let mut ct = ChunkTracker::new(have.into_dyn(), selected, l, &files).unwrap();
+        let p0 = l.validate_piece_index(0).unwrap();
+        assert_eq!(ct.received_bytes(p0), 0);
+
+        let block = vec![0u8; CHUNK_SIZE as usize];
+        ct.mark_chunk_downloaded(&Piece::from_data(0, CHUNK_SIZE, &block[..]));
+        assert_eq!(ct.received_bytes(p0), u64::from(CHUNK_SIZE));
+
+        ct.mark_piece_broken_if_not_have(p0);
+        assert_eq!(ct.received_bytes(p0), 0, "a failed piece starts over");
     }
 
     #[test]

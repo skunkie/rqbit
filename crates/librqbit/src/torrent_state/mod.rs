@@ -288,6 +288,22 @@ impl ManagedTorrent {
         self.with_chunk_tracker(|chunks| chunks.get_have_pieces().as_bytes().to_vec())
     }
 
+    /// The bytes received so far of each of `pieces`, in their order, whether
+    /// or not they have passed their hash checks. An invalid index counts none.
+    pub fn received_piece_bytes(&self, pieces: &[u32]) -> anyhow::Result<Vec<u64>> {
+        self.with_chunk_tracker(|chunks| {
+            let lengths = chunks.get_lengths();
+            pieces
+                .iter()
+                .map(|&piece| {
+                    lengths
+                        .validate_piece_index(piece)
+                        .map_or(0, |piece| chunks.received_bytes(piece))
+                })
+                .collect()
+        })
+    }
+
     /// Get the live state if the torrent is live.
     pub fn live(&self) -> Option<Arc<TorrentStateLive>> {
         let g = self.locked.read();
